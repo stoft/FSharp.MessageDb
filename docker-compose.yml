@@ -1,0 +1,29 @@
+version: "3.5"
+
+services:
+  postgres:
+    image: postgres:14.0
+    hostname: postgres
+    ports:
+      - "11111:5432"
+    volumes:
+      - postgres_data_message_db:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: message_store
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret
+
+  message_db:
+    build: ./
+    depends_on:
+      - postgres
+    environment:
+      CREATE_DATABASE: "off"
+      DATABASE_NAME: message_store
+      PGHOST: postgres
+      PGUSER: admin
+      PGPORT: 5432
+      PGPASSWORD: secret
+
+volumes:
+  postgres_data_message_db:
