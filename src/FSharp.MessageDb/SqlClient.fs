@@ -1,5 +1,8 @@
 ﻿namespace FSharp.MessageDb.SqlClient
 
+open System.Threading.Tasks
+
+// ref: https://github.com/sebfia/message-db-event-store
 // Copied from https://github.com/sebfia/message-db-event-store/blob/master/src/Contracts/Contracts.fs
 [<AutoOpen>]
 module Contracts =
@@ -27,8 +30,8 @@ module Contracts =
     type SuccessResponse =
         | MessageAppended of streamName: string * messageNumber: int64
         | MessagesAppended of streamName: string * lastMessageNumber: int64
-        | StreamMessagesRead of streamName: string * recordedMessages: RecordedMessage array
-        | CategoryMessagesRead of categoryName: string * recordedMessages: RecordedMessage array
+        | StreamMessagesRead of streamName: string * recordedMessages: RecordedMessage list
+        | CategoryMessagesRead of categoryName: string * recordedMessages: RecordedMessage list
 
     type ErrorResponse = WrongExpectedVersion of errMessage: string
 
@@ -65,262 +68,205 @@ module DbConnectionString =
     let toString: DbConnectionString -> string = fun (DbConnectionString s) -> s
 
 module Store =
-    open System.Threading.Tasks
     open Npgsql.FSharp
     open FsToolkit.ErrorHandling
 
-    (*
-write_message
-get_stream_messages
-get_category_messages
-get_last_message
-stream_version
-id
-cardinal_id
-category
-is_category
-acquire_lock
-hash_64
-message_store_version
-    *)
+    let private readMessage (reader: RowReader) : RecordedMessage =
+        { id = System.Guid.Parse(reader.string "id")
+          streamName = reader.string "stream_name"
+          createdTimeUTC = reader.dateTime "time"
+          version = reader.int64 "position"
+          eventType = reader.string "type"
+          metadata = reader.stringOrNone "metadata"
+          data = reader.string "data" }
+
+    let private prep
+        (cnxString: DbConnectionString)
+        (query: string)
+        (parameters: List<string * SqlValue>)
+        : Sql.SqlProps =
+        cnxString
+        |> DbConnectionString.toString
+        |> Sql.connect
+        |> Sql.query query
+        |> Sql.parameters parameters
+
+    let private writeRowFunc
+        (reader: RowReader -> 'a)
+        : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a, exn>> =
+        fun cnxString query params' ->
+            prep cnxString query params'
+            |> (Sql.executeRowAsync reader)
+            |> (Task.catch >> Task.map (Result.ofChoice))
+
+    let private executeFunc
+        (reader: RowReader -> 'a)
+        : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a list, exn>> =
+        fun cnxString query params' ->
+            prep cnxString query params'
+            |> (Sql.executeAsync reader)
+            |> (Task.catch >> Task.map (Result.ofChoice))
+
+    let toQuery (functionName: string) (parameters: (string * SqlValue) list) : string =
+        sprintf
+            "SELECT %s (%s);"
+            functionName
+            (parameters
+             |> List.map (fst >> sprintf "@%s")
+             |> String.concat ", ")
 
     type MessageStore(connectionString: DbConnectionString) =
-        // /// <summary>
-        // ///
-        // /// </summary>
-        // /// <param name="streamName"></param>
-        // /// <param name="position"></param>
-        // /// <param name="batchSize"></param>
-        // /// <param name="cancellationToken"></param>
-        // /// <typeparam name="'d"></typeparam>
-        // /// <returns></returns>
-        // member __.GetStreamMessages
-        //     (
-        //         streamName: string,
-        //         ?position: int64,
-        //         ?batchSize: int64,
-        //         ?cancellationToken: CancellationToken
-        //     ) =
-        //     async {
-        //         let token =
-        //             defaultArg cancellationToken CancellationToken.None
-
-        //         use connection = new NpgsqlConnection(connectionString)
-
-        //         do!
-        //             Sql.setRole connection token "message_store"
-        //             |> Async.Ignore
-
-        //         let func =
-        //             [ Sql.stringParameter "stream_name" streamName
-        //               |> Some
-        //               Option.map (fun v -> Sql.int64Parameter "position" v) position
-        //               Option.map (fun v -> Sql.int64Parameter "batch_size" v) batchSize ]
-        //             |> List.choose id
-        //             |> Sql.createFunc connection "get_stream_messages"
-
-        //         return! Sql.executeQueryAsync connection func token readMessage
-        //     }
-        (*
-        write_message(
-              id varchar,
-              stream_name varchar,
-              type varchar,
-              data jsonb,
-              metadata jsonb DEFAULT NULL,
-              expected_version bigint DEFAULT NULL
-        )
-        *)
         member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
-            asyncResult {
-                let prep =
-                    connectionString
-                    |> DbConnectionString.toString
-                    |> Sql.connect
-                    |> Sql.query
-                        """
-                        SELECT write_message(@id, @streamName, @type, @data, @metadata, @expectedVersion);
-                        """
-                    |> Sql.parameters [ "id", Sql.text (message.id.ToString())
-                                        "streamName", Sql.text streamName
-                                        "type", Sql.text message.eventType
-                                        "data", Sql.jsonb message.data
-                                        "metadata", Sql.jsonbOrNone message.metadata
-                                        "expectedVersion", Sql.int64OrNone expectedVersion ]
+            printfn "nameof: %A" []
 
+            let funcName = "write_message"
+
+            let parameters =
+                [ nameof id, Sql.text (message.id.ToString())
+                  nameof streamName, Sql.text streamName
+                  nameof message.eventType, Sql.text message.eventType
+                  nameof message.data, Sql.jsonb message.data
+                  nameof message.metadata, Sql.jsonbOrNone message.metadata
+                  nameof expectedVersion, Sql.int64OrNone expectedVersion ]
+
+            let query = toQuery funcName parameters
+
+            let reader: RowReader -> int64 =
+                fun (read: RowReader) -> read.int64 funcName
+
+            asyncResult {
                 return!
-                    prep
-                    |> Sql.executeRowAsync (fun read -> read.int64 "write_message")
-                    |> Task.catch
-                    |> Task.map
-                        (function
-                        | Choice1Of2 result -> Ok <| MessageAppended(streamName, result)
-                        | Choice2Of2 err ->
+                    writeRowFunc reader connectionString query parameters
+                    |> TaskResult.map (fun result -> MessageAppended(streamName, result))
+                    |> TaskResult.mapError
+                        (fun err ->
                             match err.Message with
                             | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
                                 Error(WrongExpectedVersion err.Message)
                             | _ -> raise err)
             }
-// let readMessage (reader: Sql.RowReader) =
-//     { Id = Guid.Parse(reader.string "id")
-//       StreamName = reader.string "stream_name"
-//       CreatedTimeUTC = reader.dateTime "time"
-//       Version = reader.int64 "position"
-//       EventType = reader.string "type"
-//       Metadata = reader.stringOrNone "metadata"
-//       Data = reader.string "data" }
 
-// let createWriteFunc connection streamName (eventId: Guid) eventType data metadata expectedVersion =
-//     [ streamName
-//       |> Sql.stringParameter "stream_name"
-//       |> Some
-//       (eventId.ToString())
-//       |> Sql.stringParameter "id"
-//       |> Some
-//       eventType |> Sql.stringParameter "type" |> Some
-//       data |> Sql.jsonParameter "data" |> Some
-//       Option.map (fun v -> Sql.jsonParameter "metadata" v) metadata
-//       Option.map (fun v -> Sql.int64Parameter "expected_version" v) expectedVersion ]
-//     |> List.choose id
-//     |> Sql.createFunc connection "write_message"
+        member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
+            let batchSize' =
+                match batchSize with
+                | None -> None
+                | Some All -> Some -1L
+                | Some (Limited x) -> Some x
 
-// member __.GetStreamMessages
-//     (
-//         streamName: string,
-//         ?position: int64,
-//         ?batchSize: int64,
-//         ?cancellationToken: CancellationToken
-//     ) =
-//     async {
-//         let token =
-//             defaultArg cancellationToken CancellationToken.None
+            let parameters =
+                [ nameof streamName, Sql.text streamName
+                  nameof position, Sql.int64OrNone position
+                  nameof batchSize, Sql.int64OrNone batchSize'
+                  "condition", Sql.stringOrNone None ]
 
-//         use connection = new NpgsqlConnection(connectionString)
+            let query = toQuery "get_stream_messages" parameters
 
-//         do!
-//             Sql.setRole connection token "message_store"
-//             |> Async.Ignore
+            asyncResult {
+                return!
+                    executeFunc readMessage connectionString query parameters
+                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+                    |> TaskResult.mapError
+                        (fun err ->
+                            match err.Message with
+                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                                Error(WrongExpectedVersion err.Message)
+                            | _ -> raise err)
+            }
 
-//         let func =
-//             [ Sql.stringParameter "stream_name" streamName
-//               |> Some
-//               Option.map (fun v -> Sql.int64Parameter "position" v) position
-//               Option.map (fun v -> Sql.int64Parameter "batch_size" v) batchSize ]
-//             |> List.choose id
-//             |> Sql.createFunc connection "get_stream_messages"
+        member __.GetCategoryMessages
+            (
+                categoryName: string,
+                ?position: int64,
+                ?batchSize: BatchSize,
+                ?correlation: string,
+                ?consumerGroupMember: int64,
+                ?consumberGroupSize: int64
+            ) =
+            let batchSize' =
+                match batchSize with
+                | None -> None
+                | Some All -> Some -1L
+                | Some (Limited x) -> Some x
 
-//         return! Sql.executeQueryAsync connection func token readMessage
-//     }
+            let parameters =
+                [ nameof categoryName, Sql.text categoryName
+                  nameof position, Sql.int64OrNone position
+                  nameof batchSize, Sql.int64OrNone batchSize'
+                  nameof correlation, Sql.textOrNone correlation
+                  nameof consumerGroupMember, Sql.int64OrNone consumerGroupMember
+                  nameof consumberGroupSize, Sql.int64OrNone consumberGroupSize
+                  "condition", Sql.stringOrNone None ]
 
-// member __.WriteStreamMessage
-//     (
-//         streamName: string,
-//         message: UnrecordedMessage,
-//         ?expectedVersion: int64,
-//         ?cancellationToken: CancellationToken
-//     ) =
-//     async {
-//         let token =
-//             defaultArg cancellationToken CancellationToken.None
+            let query =
+                toQuery "get_category_messages" parameters
 
-//         use connection = new NpgsqlConnection(connectionString)
+            asyncResult {
+                return!
+                    executeFunc readMessage connectionString query parameters
+                    |> TaskResult.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
+                    |> TaskResult.mapError
+                        (fun err ->
+                            match err.Message with
+                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                                Error(WrongExpectedVersion err.Message)
+                            | _ -> raise err)
+            }
 
-//         do!
-//             Sql.setRole connection token "message_store"
-//             |> Async.Ignore
+        member __.GetLastMessage(streamName: string) =
+            let parameters =
+                [ nameof streamName, Sql.text streamName ]
 
-//         let func =
-//             createWriteFunc
-//                 connection
-//                 streamName
-//                 message.Id
-//                 message.Data
-//                 message.Data
-//                 message.Metadata
-//                 expectedVersion
+            let query =
+                toQuery "get_last_stream_message" parameters
 
-//         match! Sql.executeScalarAsync<int64> connection [| func |] token with
-//         | Error exn -> return Error exn
-//         | Ok lst -> return lst |> List.head |> Ok
-//     }
+            asyncResult {
+                return!
+                    executeFunc readMessage connectionString query parameters
+                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+                    |> TaskResult.mapError
+                        (fun err ->
+                            match err.Message with
+                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                                Error(WrongExpectedVersion err.Message)
+                            | _ -> raise err)
+            }
 
-// member __.WriteStreamMessages
-//     (
-//         streamName: string,
-//         messages: UnrecordedMessage array,
-//         ?expectedVersion: int64,
-//         ?cancellationToken: CancellationToken
-//     ) =
-//     async {
-//         let token =
-//             defaultArg cancellationToken CancellationToken.None
+        member __.GetStreamVersion(streamName: string) =
+            let parameters =
+                [ nameof streamName, Sql.text streamName ]
 
-//         use connection = new NpgsqlConnection(connectionString)
+            let funcName = "stream_version"
 
-//         do!
-//             Sql.setRole connection token "message_store"
-//             |> Async.Ignore
+            let query = toQuery funcName parameters
 
-//         let createWriteFunc' = createWriteFunc connection streamName
+            let reader: RowReader -> int64 =
+                fun (read: RowReader) -> read.int64 funcName
 
-//         let funcs =
-//             messages
-//             |> Array.mapi
-//                 (fun i m ->
-//                     createWriteFunc'
-//                         m.Id
-//                         m.EventType
-//                         m.Data
-//                         m.Metadata
-//                         (if i > 0 then None else expectedVersion))
+            asyncResult {
+                return!
+                    executeFunc reader connectionString query parameters
+                    |> TaskResult.mapError
+                        (fun err ->
+                            match err.Message with
+                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                                Error(WrongExpectedVersion err.Message)
+                            | _ -> raise err)
+            }
 
-//         return! Sql.executeScalarAsync connection funcs token
-//     }
+        member __.GetCategory(streamName: string) =
+            let parameters =
+                [ nameof streamName, Sql.text streamName ]
 
-// member __.GetLastStreamMessage(streamName: string, ?cancellationToken) =
-//     async {
-//         let token =
-//             defaultArg cancellationToken CancellationToken.None
+            let query = toQuery "stream_version" parameters
 
-//         use connection = new NpgsqlConnection(connectionString)
-
-//         do!
-//             Sql.setRole connection token "message_store"
-//             |> Async.Ignore
-
-//         let func =
-//             [ Sql.stringParameter "stream_name" streamName ]
-//             |> Sql.createFunc connection "get_last_stream_message"
-
-//         match! Sql.executeQueryAsync connection func token readMessage with
-//         | Ok lst -> return Ok(lst |> List.tryHead)
-//         | Error exn -> return Error exn
-//     }
-
-// member __.GetLastStreamVersion(streamName: string, ?cancellationToken) =
-//     async {
-//         let token =
-//             defaultArg cancellationToken CancellationToken.None
-
-//         use connection = new NpgsqlConnection(connectionString)
-
-//         do!
-//             Sql.setRole connection token "message_store"
-//             |> Async.Ignore
-
-//         let func =
-//             [ Sql.stringParameter "stream_name" streamName ]
-//             |> Sql.createFunc connection "stream_version"
-
-//         match! Sql.executeQueryAsync connection func token (fun r -> r.int64OrNone "") with
-//         | Ok lst ->
-//             return
-//                 Ok(
-//                     lst
-//                     |> List.head
-//                     |> function
-//                         | Some i -> i
-//                         | _ -> -1L
-//                 )
-//         | Error exn -> return Error exn
-//     }
+            asyncResult {
+                return!
+                    executeFunc readMessage connectionString query parameters
+                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+                    |> TaskResult.mapError
+                        (fun err ->
+                            match err.Message with
+                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                                Error(WrongExpectedVersion err.Message)
+                            | _ -> raise err)
+            }
