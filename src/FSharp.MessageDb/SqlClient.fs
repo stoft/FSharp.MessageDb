@@ -91,10 +91,12 @@ module Store =
         |> Sql.query query
         |> Sql.parameters parameters
 
-    let private writeRowFunc
+    let private executeRowFunc
         (reader: RowReader -> 'a)
         : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a, exn>> =
         fun cnxString query params' ->
+            printfn "executing row query: %s" query
+
             prep cnxString query params'
             |> (Sql.executeRowAsync reader)
             |> (Task.catch >> Task.map (Result.ofChoice))
@@ -103,19 +105,24 @@ module Store =
         (reader: RowReader -> 'a)
         : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a list, exn>> =
         fun cnxString query params' ->
+            printfn "executing query: %s" query
+
             prep cnxString query params'
             |> (Sql.executeAsync reader)
             |> (Task.catch >> Task.map (Result.ofChoice))
 
-    let toQuery (functionName: string) (parameters: (string * SqlValue) list) : string =
+    let private toQuery (functionName: string) (parameters: (string * SqlValue) list) : string =
         sprintf
-            "SELECT %s (%s);"
+            "SELECT * FROM %s (%s);"
             functionName
             (parameters
              |> List.map (fst >> sprintf "@%s")
              |> String.concat ", ")
 
     type MessageStore(connectionString: DbConnectionString) =
+        // let mutable connection : Npgsql.NpgsqlConnection
+        // new(connection : Npgsql.NpgsqlConnection) =
+        //     this.connection <- connection
         member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
             printfn "nameof: %A" []
 
@@ -134,17 +141,14 @@ module Store =
             let reader: RowReader -> int64 =
                 fun (read: RowReader) -> read.int64 funcName
 
-            asyncResult {
-                return!
-                    writeRowFunc reader connectionString query parameters
-                    |> TaskResult.map (fun result -> MessageAppended(streamName, result))
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            executeRowFunc reader connectionString query parameters
+            |> TaskResult.map (fun result -> MessageAppended(streamName, result))
+            |> TaskResult.mapError
+                (fun err ->
+                    match err.Message with
+                    | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+                        Error(WrongExpectedVersion err.Message)
+                    | _ -> raise err)
 
         member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
             let batchSize' =
@@ -161,17 +165,8 @@ module Store =
 
             let query = toQuery "get_stream_messages" parameters
 
-            asyncResult {
-                return!
-                    executeFunc readMessage connectionString query parameters
-                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            executeFunc readMessage connectionString query parameters
+            |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
         member __.GetCategoryMessages
             (
@@ -200,17 +195,8 @@ module Store =
             let query =
                 toQuery "get_category_messages" parameters
 
-            asyncResult {
-                return!
-                    executeFunc readMessage connectionString query parameters
-                    |> TaskResult.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            executeFunc readMessage connectionString query parameters
+            |> TaskResult.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
 
         member __.GetLastMessage(streamName: string) =
             let parameters =
@@ -219,17 +205,8 @@ module Store =
             let query =
                 toQuery "get_last_stream_message" parameters
 
-            asyncResult {
-                return!
-                    executeFunc readMessage connectionString query parameters
-                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            executeFunc readMessage connectionString query parameters
+            |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
         member __.GetStreamVersion(streamName: string) =
             let parameters =
@@ -242,31 +219,26 @@ module Store =
             let reader: RowReader -> int64 =
                 fun (read: RowReader) -> read.int64 funcName
 
-            asyncResult {
-                return!
-                    executeFunc reader connectionString query parameters
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            executeRowFunc reader connectionString query parameters
 
         member __.GetCategory(streamName: string) =
             let parameters =
                 [ nameof streamName, Sql.text streamName ]
 
-            let query = toQuery "stream_version" parameters
+            let funcName = "category"
 
-            asyncResult {
-                return!
-                    executeFunc readMessage connectionString query parameters
-                    |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
-                    |> TaskResult.mapError
-                        (fun err ->
-                            match err.Message with
-                            | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                                Error(WrongExpectedVersion err.Message)
-                            | _ -> raise err)
-            }
+            let query = toQuery funcName parameters
+
+            let reader: RowReader -> string =
+                fun (read: RowReader) -> read.string funcName
+
+            executeRowFunc reader connectionString query parameters
+
+        member __.DeleteMessage(id: System.Guid) =
+            let parameters = [ nameof id, Sql.uuid id ]
+
+            let query = "DELETE FROM messages WHERE id = @id;"
+
+            prep connectionString query parameters
+            |> Sql.executeNonQueryAsync
+            |> (Task.catch >> Task.map (Result.ofChoice))
