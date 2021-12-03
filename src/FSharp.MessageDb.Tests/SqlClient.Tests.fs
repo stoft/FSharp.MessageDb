@@ -34,9 +34,9 @@ let testMessage id : UnrecordedMessage =
 [<Tests>]
 let tests =
     testList
-        "message-store"
+        "SqlLib"
         [ testList
-            "write_message"
+            "writeMessage"
             [ test "any position should succeed" {
                 let guid =
                     System.Guid.Parse "ce83d845-2620-475c-abb6-94f727990ee8"
@@ -48,7 +48,7 @@ let tests =
                       data = "{}" }
 
                 let result =
-                    store.WriteMessage("test-stream1", input).Result
+                    (SqlLib.writeMessage "test-stream1" input).Result
 
                 Expect.wantOk "" result |> ignore
                 teardown guid |> ignore

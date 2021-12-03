@@ -1,4 +1,4 @@
-﻿namespace FSharp.MessageDb.SqlClient
+﻿namespace FSharp.MessageDb
 
 open System.Threading.Tasks
 
@@ -45,6 +45,13 @@ module Contracts =
 
 type DbConnectionString = internal DbConnectionString of string
 
+module Int64 =
+    let ofBatchSizeOption =
+        function
+        | None -> None
+        | Some All -> Some -1L
+        | Some (Limited x) -> Some x
+
 module DbConnectionString =
     type DbConfig =
         { dbUsername: string
@@ -67,9 +74,18 @@ module DbConnectionString =
 
     let toString: DbConnectionString -> string = fun (DbConnectionString s) -> s
 
-module Store =
+
+module SqlLib =
     open Npgsql.FSharp
-    open FsToolkit.ErrorHandling
+
+    let private toFunc (functionName: string) (parameters: (string * SqlValue) list) =
+        Sql.func
+        <| sprintf
+            "SELECT * FROM %s (%s);"
+            functionName
+            (parameters
+             |> List.map (fst >> sprintf "@%s")
+             |> String.concat ", ")
 
     let private readMessage (reader: RowReader) : RecordedMessage =
         { id = System.Guid.Parse(reader.string "id")
@@ -80,34 +96,136 @@ module Store =
           metadata = reader.stringOrNone "metadata"
           data = reader.string "data" }
 
+    let private int64Reader name (read: RowReader) = read.int64 name
+    let private stringReader name (read: RowReader) = read.string name
+
+    let writeMessage
+        (streamName: string)
+        (message: UnrecordedMessage)
+        (expectedVersion: int64 option)
+        (sqlProps: Sql.SqlProps)
+        : ((RowReader -> int64) * Sql.SqlProps) =
+        let funcName = "write_message"
+
+        let parameters =
+            [ nameof id, Sql.text (message.id.ToString())
+              nameof streamName, Sql.text streamName
+              nameof message.eventType, Sql.text message.eventType
+              nameof message.data, Sql.jsonb message.data
+              nameof message.metadata, Sql.jsonbOrNone message.metadata
+              nameof expectedVersion, Sql.int64OrNone expectedVersion ]
+
+        let func = toFunc funcName parameters sqlProps
+
+        (int64Reader funcName, func)
+
+    let getStreamMessages
+        (streamName: string)
+        (position: int64 option)
+        (batchSize: BatchSize option)
+        (sqlProps: Sql.SqlProps)
+        =
+
+        let parameters =
+            [ nameof streamName, Sql.text streamName
+              nameof position, Sql.int64OrNone position
+              nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
+              "condition", Sql.stringOrNone None ]
+
+        let func =
+            toFunc "get_stream_messages" parameters sqlProps
+
+        (readMessage, func)
+
+    let getCategoryMessages
+        (categoryName: string)
+        (position: int64 option)
+        (batchSize: BatchSize option)
+        (correlation: string option)
+        (consumerGroupMember: int64 option)
+        (consumberGroupSize: int64 option)
+        (sqlProps: Sql.SqlProps)
+        =
+        let parameters =
+            [ nameof categoryName, Sql.text categoryName
+              nameof position, Sql.int64OrNone position
+              nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
+              nameof correlation, Sql.textOrNone correlation
+              nameof consumerGroupMember, Sql.int64OrNone consumerGroupMember
+              nameof consumberGroupSize, Sql.int64OrNone consumberGroupSize
+              "condition", Sql.stringOrNone None ]
+
+        let func =
+            toFunc "get_category_messages" parameters sqlProps
+
+        (readMessage, func)
+
+    let getLastMessage (streamName: string) (sqlProps: Sql.SqlProps) =
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
+
+        let func =
+            toFunc "get_last_stream_message" parameters sqlProps
+
+        (readMessage, func)
+
+    let getStreamVersion (streamName: string) sqlProps =
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
+
+        let funcName = "stream_version"
+
+        let func = toFunc funcName parameters sqlProps
+
+        (int64Reader funcName, func)
+
+    let getCategory (streamName: string) sqlProps =
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
+
+        let funcName = "category"
+
+        let func = toFunc funcName parameters sqlProps
+
+        (stringReader funcName, func)
+
+    let deleteMessage (id: System.Guid) sqlProps =
+        sqlProps
+        |> Sql.query "DELETE FROM messages WHERE id = @id;"
+        |> Sql.parameters [ nameof id, Sql.uuid id ]
+
+module Store =
+    open Npgsql.FSharp
+    open FsToolkit.ErrorHandling
+
     let private prep
-        (cnxString: DbConnectionString)
+        (connection: Npgsql.NpgsqlConnection)
         (query: string)
         (parameters: List<string * SqlValue>)
         : Sql.SqlProps =
-        cnxString
-        |> DbConnectionString.toString
-        |> Sql.connect
+
+        connection
+        |> Sql.existingConnection
         |> Sql.query query
         |> Sql.parameters parameters
 
     let private executeRowFunc
         (reader: RowReader -> 'a)
-        : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a, exn>> =
-        fun cnxString query params' ->
+        : Npgsql.NpgsqlConnection -> string -> List<string * SqlValue> -> Task<Result<'a, exn>> =
+        fun connection query params' ->
             printfn "executing row query: %s" query
 
-            prep cnxString query params'
+            prep connection query params'
             |> (Sql.executeRowAsync reader)
             |> (Task.catch >> Task.map (Result.ofChoice))
 
     let private executeFunc
         (reader: RowReader -> 'a)
-        : DbConnectionString -> string -> List<string * SqlValue> -> Task<Result<'a list, exn>> =
-        fun cnxString query params' ->
+        : Npgsql.NpgsqlConnection -> string -> List<string * SqlValue> -> Task<Result<'a list, exn>> =
+        fun connection query params' ->
             printfn "executing query: %s" query
 
-            prep cnxString query params'
+            prep connection query params'
             |> (Sql.executeAsync reader)
             |> (Task.catch >> Task.map (Result.ofChoice))
 
@@ -126,47 +244,26 @@ module Store =
         member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
             printfn "nameof: %A" []
 
-            let funcName = "write_message"
-
-            let parameters =
-                [ nameof id, Sql.text (message.id.ToString())
-                  nameof streamName, Sql.text streamName
-                  nameof message.eventType, Sql.text message.eventType
-                  nameof message.data, Sql.jsonb message.data
-                  nameof message.metadata, Sql.jsonbOrNone message.metadata
-                  nameof expectedVersion, Sql.int64OrNone expectedVersion ]
-
-            let query = toQuery funcName parameters
-
-            let reader: RowReader -> int64 =
-                fun (read: RowReader) -> read.int64 funcName
-
-            executeRowFunc reader connectionString query parameters
-            |> TaskResult.map (fun result -> MessageAppended(streamName, result))
-            |> TaskResult.mapError
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.writeMessage streamName message expectedVersion
+            ||> Sql.executeRowAsync
+            |> TaskResult.ofTask
+            |> TaskResult.catch
                 (fun err ->
                     match err.Message with
-                    | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
-                        Error(WrongExpectedVersion err.Message)
+                    | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
                     | _ -> raise err)
+            |> TaskResult.map (fun result -> MessageAppended(streamName, result))
 
         member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
-            let batchSize' =
-                match batchSize with
-                | None -> None
-                | Some All -> Some -1L
-                | Some (Limited x) -> Some x
-
-            let parameters =
-                [ nameof streamName, Sql.text streamName
-                  nameof position, Sql.int64OrNone position
-                  nameof batchSize, Sql.int64OrNone batchSize'
-                  "condition", Sql.stringOrNone None ]
-
-            let query = toQuery "get_stream_messages" parameters
-
-            executeFunc readMessage connectionString query parameters
-            |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.getStreamMessages streamName position batchSize
+            ||> Sql.executeAsync
+            |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
         member __.GetCategoryMessages
             (
@@ -177,68 +274,59 @@ module Store =
                 ?consumerGroupMember: int64,
                 ?consumberGroupSize: int64
             ) =
-            let batchSize' =
-                match batchSize with
-                | None -> None
-                | Some All -> Some -1L
-                | Some (Limited x) -> Some x
-
-            let parameters =
-                [ nameof categoryName, Sql.text categoryName
-                  nameof position, Sql.int64OrNone position
-                  nameof batchSize, Sql.int64OrNone batchSize'
-                  nameof correlation, Sql.textOrNone correlation
-                  nameof consumerGroupMember, Sql.int64OrNone consumerGroupMember
-                  nameof consumberGroupSize, Sql.int64OrNone consumberGroupSize
-                  "condition", Sql.stringOrNone None ]
-
-            let query =
-                toQuery "get_category_messages" parameters
-
-            executeFunc readMessage connectionString query parameters
-            |> TaskResult.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.getCategoryMessages
+                categoryName
+                position
+                batchSize
+                correlation
+                consumerGroupMember
+                consumberGroupSize
+            ||> Sql.executeAsync
+            |> Task.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
 
         member __.GetLastMessage(streamName: string) =
-            let parameters =
-                [ nameof streamName, Sql.text streamName ]
-
-            let query =
-                toQuery "get_last_stream_message" parameters
-
-            executeFunc readMessage connectionString query parameters
-            |> TaskResult.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.getLastMessage streamName
+            ||> Sql.executeAsync
+            |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
         member __.GetStreamVersion(streamName: string) =
-            let parameters =
-                [ nameof streamName, Sql.text streamName ]
-
-            let funcName = "stream_version"
-
-            let query = toQuery funcName parameters
-
-            let reader: RowReader -> int64 =
-                fun (read: RowReader) -> read.int64 funcName
-
-            executeRowFunc reader connectionString query parameters
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.getStreamVersion streamName
+            ||> Sql.executeRowAsync
 
         member __.GetCategory(streamName: string) =
-            let parameters =
-                [ nameof streamName, Sql.text streamName ]
-
-            let funcName = "category"
-
-            let query = toQuery funcName parameters
-
-            let reader: RowReader -> string =
-                fun (read: RowReader) -> read.string funcName
-
-            executeRowFunc reader connectionString query parameters
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.getCategory streamName
+            ||> Sql.executeRowAsync
 
         member __.DeleteMessage(id: System.Guid) =
-            let parameters = [ nameof id, Sql.uuid id ]
-
-            let query = "DELETE FROM messages WHERE id = @id;"
-
-            prep connectionString query parameters
+            connectionString
+            |> DbConnectionString.toString
+            |> Sql.connect
+            |> SqlLib.deleteMessage id
             |> Sql.executeNonQueryAsync
-            |> (Task.catch >> Task.map (Result.ofChoice))
+
+type Client = { executionType: ExecutionType }
+
+and ExecutionType =
+    | ConnectionString of string
+    | Connection of Npgsql.NpgsqlConnection
+
+type ExclusiveConsumer = ExclusiveConsumer of unit
+
+type GroupConsumer = GroupConsumer of unit
+
+module Client =
+
+    let ofConnectionString: string -> Client = failwith "ni"
+    let ofConnection: Npgsql.NpgsqlConnection -> Client = failwith "ni"
