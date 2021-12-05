@@ -2,7 +2,8 @@ module SqlClient.Tests
 
 open Expecto
 open Expecto.Flip
-open FSharp.MessageDb.SqlClient
+open FSharp.MessageDb
+open Npgsql.Logging
 
 let message =
     { id = (System.Guid.NewGuid())
@@ -11,7 +12,7 @@ let message =
       data = "{}" }
 
 let store =
-    Store.MessageStore(
+    StatelessClient.StatelessClient(
         DbConnectionString.create
             { dbHost = "localhost"
               dbUsername = "admin"
@@ -31,6 +32,10 @@ let testMessage id : UnrecordedMessage =
       metadata = None
       data = "{}" }
 
+let _ =
+    NpgsqlLogManager.Provider <- ConsoleLoggingProvider(NpgsqlLogLevel.Debug, true)
+    NpgsqlLogManager.IsParameterLoggingEnabled <- true
+
 [<Tests>]
 let tests =
     testList
@@ -48,13 +53,13 @@ let tests =
                       data = "{}" }
 
                 let result =
-                    (SqlLib.writeMessage "test-stream1" input).Result
+                    store.WriteMessage("test-stream1", input).Result
 
                 Expect.wantOk "" result |> ignore
                 teardown guid |> ignore
               }
 
-              test "writing with position 0 should fail" {
+              test "writing with position 0 on non-existant stream should fail" {
                   let guid =
                       System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a7"
 
@@ -73,7 +78,34 @@ let tests =
                           )
                           .Result
 
-                  Expect.wantError "should fail" result2 |> ignore
+                  Expect.wantError "should fail" result2
+                  |> Expect.equal
+                      ""
+                      (WrongExpectedVersion
+                          "P0001: Wrong expected version: 0 (Stream: test-stream2, Stream Version: -1)")
+
+                  guid |> teardown |> ignore
+              }
+              test "writing with position -1 on non-existant stream should succeed" {
+                  let guid =
+                      System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a8"
+
+                  let input =
+                      { id = guid
+                        eventType = "test-event"
+                        metadata = None
+                        data = "{}" }
+
+                  let result2 =
+                      store
+                          .WriteMessage(
+                              "test-stream3",
+                              input,
+                              -1L
+                          )
+                          .Result
+
+                  Expect.wantOk "should succeed" result2 |> ignore
 
                   guid |> teardown |> ignore
               } ]
@@ -114,7 +146,6 @@ let tests =
                     |> ignore
 
                     let result = (teardown guid).Result
-
-                    Expect.wantOk "" result |> Expect.equal "" 1
+                    result |> Expect.equal "" 1
 
                 } ] ]

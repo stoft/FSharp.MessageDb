@@ -1,6 +1,8 @@
 ﻿namespace FSharp.MessageDb
 
 open System.Threading.Tasks
+open FsToolkit.ErrorHandling
+open Npgsql.FSharp
 
 // ref: https://github.com/sebfia/message-db-event-store
 // Copied from https://github.com/sebfia/message-db-event-store/blob/master/src/Contracts/Contracts.fs
@@ -45,6 +47,15 @@ module Contracts =
 
 type DbConnectionString = internal DbConnectionString of string
 
+module internal Result =
+    let catch f x =
+        let q = Task.catch
+
+        try
+            f x |> Ok
+        with
+        | exn -> Error exn
+
 module Int64 =
     let ofBatchSizeOption =
         function
@@ -74,18 +85,17 @@ module DbConnectionString =
 
     let toString: DbConnectionString -> string = fun (DbConnectionString s) -> s
 
-
 module SqlLib =
-    open Npgsql.FSharp
 
     let private toFunc (functionName: string) (parameters: (string * SqlValue) list) =
-        Sql.func
+        Sql.query
         <| sprintf
-            "SELECT * FROM %s (%s);"
+            "SET role message_store; SELECT * FROM %s(%s);"
             functionName
             (parameters
              |> List.map (fst >> sprintf "@%s")
              |> String.concat ", ")
+        >> Sql.parameters parameters
 
     let private readMessage (reader: RowReader) : RecordedMessage =
         { id = System.Guid.Parse(reader.string "id")
@@ -98,6 +108,11 @@ module SqlLib =
 
     let private int64Reader name (read: RowReader) = read.int64 name
     let private stringReader name (read: RowReader) = read.string name
+
+    let internal matchWrongExpectedVersion (err: exn) =
+        match err.Message with
+        | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
+        | _ -> raise err
 
     let writeMessage
         (streamName: string)
@@ -194,127 +209,105 @@ module SqlLib =
         |> Sql.query "DELETE FROM messages WHERE id = @id;"
         |> Sql.parameters [ nameof id, Sql.uuid id ]
 
-module Store =
-    open Npgsql.FSharp
-    open FsToolkit.ErrorHandling
+module InternalClient =
+    let internal writeMessageAsync streamName message expectedVersion sqlProps =
+        sqlProps
+        |> SqlLib.writeMessage streamName message expectedVersion
+        ||> Sql.executeRowAsync
+        |> TaskResult.ofTask
+        |> TaskResult.catch (SqlLib.matchWrongExpectedVersion)
+        |> TaskResult.map (fun result -> MessageAppended(streamName, result))
 
-    let private prep
-        (connection: Npgsql.NpgsqlConnection)
-        (query: string)
-        (parameters: List<string * SqlValue>)
-        : Sql.SqlProps =
+    let internal writeMessageSync streamName message expectedVersion sqlProps =
+        sqlProps
+        |> SqlLib.writeMessage streamName message expectedVersion
+        |> Result.catch (fun tuple -> tuple ||> Sql.executeRow)
+        |> Result.mapError SqlLib.matchWrongExpectedVersion
+        |> Result.map (fun result -> MessageAppended(streamName, result))
 
-        connection
-        |> Sql.existingConnection
-        |> Sql.query query
-        |> Sql.parameters parameters
 
-    let private executeRowFunc
-        (reader: RowReader -> 'a)
-        : Npgsql.NpgsqlConnection -> string -> List<string * SqlValue> -> Task<Result<'a, exn>> =
-        fun connection query params' ->
-            printfn "executing row query: %s" query
+    let internal getStreamMessages streamName position batchSize sqlProps =
+        sqlProps
+        |> SqlLib.getStreamMessages streamName position batchSize
+        ||> Sql.executeAsync
+        |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
-            prep connection query params'
-            |> (Sql.executeRowAsync reader)
-            |> (Task.catch >> Task.map (Result.ofChoice))
+    let internal getCategoryMessages
+        categoryName
+        position
+        batchSize
+        correlation
+        consumerGroupMember
+        consumberGroupSize
+        sqlProps
+        =
+        sqlProps
+        |> SqlLib.getCategoryMessages categoryName position batchSize correlation consumerGroupMember consumberGroupSize
+        ||> Sql.executeAsync
+        |> Task.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
 
-    let private executeFunc
-        (reader: RowReader -> 'a)
-        : Npgsql.NpgsqlConnection -> string -> List<string * SqlValue> -> Task<Result<'a list, exn>> =
-        fun connection query params' ->
-            printfn "executing query: %s" query
+    let internal getLastMessage streamName sqlProps =
+        sqlProps
+        |> SqlLib.getLastMessage streamName
+        ||> Sql.executeAsync
+        |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
-            prep connection query params'
-            |> (Sql.executeAsync reader)
-            |> (Task.catch >> Task.map (Result.ofChoice))
+    let internal getStreamVersion streamName sqlProps =
+        sqlProps
+        |> SqlLib.getStreamVersion streamName
+        ||> Sql.executeRowAsync
 
-    let private toQuery (functionName: string) (parameters: (string * SqlValue) list) : string =
-        sprintf
-            "SELECT * FROM %s (%s);"
-            functionName
-            (parameters
-             |> List.map (fst >> sprintf "@%s")
-             |> String.concat ", ")
+type StatelessClient(connectionString: string) =
+    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
+        connectionString
+        |> Sql.connect
+        |> InternalClient.writeMessageAsync streamName message expectedVersion
 
-    type MessageStore(connectionString: DbConnectionString) =
-        // let mutable connection : Npgsql.NpgsqlConnection
-        // new(connection : Npgsql.NpgsqlConnection) =
-        //     this.connection <- connection
-        member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
-            printfn "nameof: %A" []
+    member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
+        connectionString
+        |> Sql.connect
+        |> InternalClient.getStreamMessages streamName position batchSize
 
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.writeMessage streamName message expectedVersion
-            ||> Sql.executeRowAsync
-            |> TaskResult.ofTask
-            |> TaskResult.catch
-                (fun err ->
-                    match err.Message with
-                    | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
-                    | _ -> raise err)
-            |> TaskResult.map (fun result -> MessageAppended(streamName, result))
+    member __.GetCategoryMessages
+        (
+            categoryName: string,
+            ?position: int64,
+            ?batchSize: BatchSize,
+            ?correlation: string,
+            ?consumerGroupMember: int64,
+            ?consumberGroupSize: int64
+        ) =
+        connectionString
+        |> Sql.connect
+        |> InternalClient.getCategoryMessages
+            categoryName
+            position
+            batchSize
+            correlation
+            consumerGroupMember
+            consumberGroupSize
 
-        member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.getStreamMessages streamName position batchSize
-            ||> Sql.executeAsync
-            |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+    member __.GetLastMessage(streamName: string) =
+        connectionString
+        |> Sql.connect
+        |> InternalClient.getLastMessage streamName
 
-        member __.GetCategoryMessages
-            (
-                categoryName: string,
-                ?position: int64,
-                ?batchSize: BatchSize,
-                ?correlation: string,
-                ?consumerGroupMember: int64,
-                ?consumberGroupSize: int64
-            ) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.getCategoryMessages
-                categoryName
-                position
-                batchSize
-                correlation
-                consumerGroupMember
-                consumberGroupSize
-            ||> Sql.executeAsync
-            |> Task.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
+    member __.GetStreamVersion(streamName: string) =
+        connectionString
+        |> Sql.connect
+        |> InternalClient.getStreamVersion streamName
 
-        member __.GetLastMessage(streamName: string) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.getLastMessage streamName
-            ||> Sql.executeAsync
-            |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+    member __.GetCategory(streamName: string) =
+        connectionString
+        |> Sql.connect
+        |> SqlLib.getCategory streamName
+        ||> Sql.executeRowAsync
 
-        member __.GetStreamVersion(streamName: string) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.getStreamVersion streamName
-            ||> Sql.executeRowAsync
-
-        member __.GetCategory(streamName: string) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.getCategory streamName
-            ||> Sql.executeRowAsync
-
-        member __.DeleteMessage(id: System.Guid) =
-            connectionString
-            |> DbConnectionString.toString
-            |> Sql.connect
-            |> SqlLib.deleteMessage id
-            |> Sql.executeNonQueryAsync
+    member __.DeleteMessage(id: System.Guid) =
+        connectionString
+        |> Sql.connect
+        |> SqlLib.deleteMessage id
+        |> Sql.executeNonQueryAsync
 
 type Client = { executionType: ExecutionType }
 
@@ -322,11 +315,63 @@ and ExecutionType =
     | ConnectionString of string
     | Connection of Npgsql.NpgsqlConnection
 
+type Synchronicity =
+    | Sync
+    | EagerAsyncTasks
+// | LazyAsyncs
+
 type ExclusiveConsumer = ExclusiveConsumer of unit
 
 type GroupConsumer = GroupConsumer of unit
 
-module Client =
+type StatefulClient(connection: Npgsql.NpgsqlConnection) =
+    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
+        connection
+        |> Sql.existingConnection
+        |> InternalClient.writeMessageAsync streamName message expectedVersion
 
-    let ofConnectionString: string -> Client = failwith "ni"
-    let ofConnection: Npgsql.NpgsqlConnection -> Client = failwith "ni"
+    member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
+        connection
+        |> Sql.existingConnection
+        |> InternalClient.getStreamMessages streamName position batchSize
+
+    member __.GetCategoryMessages
+        (
+            categoryName: string,
+            ?position: int64,
+            ?batchSize: BatchSize,
+            ?correlation: string,
+            ?consumerGroupMember: int64,
+            ?consumberGroupSize: int64
+        ) =
+        connection
+        |> Sql.existingConnection
+        |> InternalClient.getCategoryMessages
+            categoryName
+            position
+            batchSize
+            correlation
+            consumerGroupMember
+            consumberGroupSize
+
+    member __.GetLastMessage(streamName: string) =
+        connection
+        |> Sql.existingConnection
+        |> InternalClient.getLastMessage streamName
+
+    member __.GetStreamVersion(streamName: string) =
+        connection
+        |> Sql.existingConnection
+        |> InternalClient.getStreamVersion streamName
+
+    member __.GetCategory(streamName: string) =
+        connection
+        |> Sql.existingConnection
+        |> SqlLib.getCategory streamName
+        ||> Sql.executeRowAsync
+
+    member __.DeleteMessage(id: System.Guid) =
+        connection
+        |> Sql.existingConnection
+        |> SqlLib.deleteMessage id
+        |> Sql.executeNonQueryAsync
