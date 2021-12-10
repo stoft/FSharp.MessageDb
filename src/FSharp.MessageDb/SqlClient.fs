@@ -15,6 +15,7 @@ module Contracts =
           streamName: string
           createdTimeUTC: DateTime
           version: int64
+          globalPosition: int64
           eventType: string
           metadata: string option
           data: string }
@@ -29,21 +30,15 @@ module Contracts =
         | All
         | Limited of int64
 
-    type SuccessResponse =
-        | MessageAppended of streamName: string * messageNumber: int64
-        | MessagesAppended of streamName: string * lastMessageNumber: int64
-        | StreamMessagesRead of streamName: string * recordedMessages: RecordedMessage list
-        | CategoryMessagesRead of categoryName: string * recordedMessages: RecordedMessage list
-
+    type StreamMessages = StreamMessages of recordedMessages: RecordedMessage list
+    type CategoryMessages = CategoryMessages of recordedMessages: RecordedMessage list
     type ErrorResponse = WrongExpectedVersion of errMessage: string
+    type GlobalPosition = GlobalPosition of position: int64
 
-    type Response = Result<SuccessResponse, string>
-
-    type Request =
-        | AppendMessage of streamName: string * expectedVersion: int64 * unrecordedEvent: UnrecordedMessage
-        | AppendMessages of streamName: string * expectedEventNumber: int64 * unrecordedEvents: UnrecordedMessage array
-        | ReadStreamMessages of streamName: string * fromEventNumber: int64 option * numEvents: BatchSize
-        | ReadCategoryMessages of categoryName: string * fromEventNumber: int64 option * numEvents: BatchSize
+    type StreamVersion =
+        | Any
+        | NoStream
+        | Version of int64
 
 type DbConnectionString = internal DbConnectionString of string
 
@@ -55,6 +50,13 @@ module internal Result =
             f x |> Ok
         with
         | exn -> Error exn
+
+module internal TaskResult =
+    let bindError: ('Error -> Task<Result<'a, 'Error2>>) -> Task<Result<'a, 'Error>> -> Task<Result<'a, 'Error2>> =
+        fun fError ->
+            Task.bind (function
+                | Ok v -> TaskResult.ok v
+                | Error e -> fError e)
 
 module Int64 =
     let ofBatchSizeOption =
@@ -85,6 +87,9 @@ module DbConnectionString =
 
     let toString: DbConnectionString -> string = fun (DbConnectionString s) -> s
 
+module StreamName =
+    let ofCategoryName (categoryName: string) (suffixId: string) = $"%s{categoryName}-%s{suffixId}"
+
 module SqlLib =
 
     let private toFunc (functionName: string) (parameters: (string * SqlValue) list) =
@@ -102,6 +107,7 @@ module SqlLib =
           streamName = reader.string "stream_name"
           createdTimeUTC = reader.dateTime "time"
           version = reader.int64 "position"
+          globalPosition = reader.int64 "global_position"
           eventType = reader.string "type"
           metadata = reader.stringOrNone "metadata"
           data = reader.string "data" }
@@ -109,7 +115,7 @@ module SqlLib =
     let private int64Reader name (read: RowReader) = read.int64 name
     let private stringReader name (read: RowReader) = read.string name
 
-    let internal matchWrongExpectedVersion (err: exn) =
+    let matchWrongExpectedVersion (err: exn) =
         match err.Message with
         | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
         | _ -> raise err
@@ -147,8 +153,7 @@ module SqlLib =
               nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
               "condition", Sql.stringOrNone None ]
 
-        let func =
-            toFunc "get_stream_messages" parameters sqlProps
+        let func = toFunc "get_stream_messages" parameters sqlProps
 
         (readMessage, func)
 
@@ -158,7 +163,7 @@ module SqlLib =
         (batchSize: BatchSize option)
         (correlation: string option)
         (consumerGroupMember: int64 option)
-        (consumberGroupSize: int64 option)
+        (consumerGroupSize: int64 option)
         (sqlProps: Sql.SqlProps)
         =
         let parameters =
@@ -167,26 +172,22 @@ module SqlLib =
               nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
               nameof correlation, Sql.textOrNone correlation
               nameof consumerGroupMember, Sql.int64OrNone consumerGroupMember
-              nameof consumberGroupSize, Sql.int64OrNone consumberGroupSize
+              nameof consumerGroupSize, Sql.int64OrNone consumerGroupSize
               "condition", Sql.stringOrNone None ]
 
-        let func =
-            toFunc "get_category_messages" parameters sqlProps
+        let func = toFunc "get_category_messages" parameters sqlProps
 
         (readMessage, func)
 
     let getLastMessage (streamName: string) (sqlProps: Sql.SqlProps) =
-        let parameters =
-            [ nameof streamName, Sql.text streamName ]
+        let parameters = [ nameof streamName, Sql.text streamName ]
 
-        let func =
-            toFunc "get_last_stream_message" parameters sqlProps
+        let func = toFunc "get_last_stream_message" parameters sqlProps
 
         (readMessage, func)
 
     let getStreamVersion (streamName: string) sqlProps =
-        let parameters =
-            [ nameof streamName, Sql.text streamName ]
+        let parameters = [ nameof streamName, Sql.text streamName ]
 
         let funcName = "stream_version"
 
@@ -195,8 +196,7 @@ module SqlLib =
         (int64Reader funcName, func)
 
     let getCategory (streamName: string) sqlProps =
-        let parameters =
-            [ nameof streamName, Sql.text streamName ]
+        let parameters = [ nameof streamName, Sql.text streamName ]
 
         let funcName = "category"
 
@@ -209,64 +209,54 @@ module SqlLib =
         |> Sql.query "DELETE FROM messages WHERE id = @id;"
         |> Sql.parameters [ nameof id, Sql.uuid id ]
 
-module InternalClient =
-    let internal writeMessageAsync streamName message expectedVersion sqlProps =
+module SqlClient =
+    let writeMessageAsync streamName message expectedVersion sqlProps =
         sqlProps
         |> SqlLib.writeMessage streamName message expectedVersion
         ||> Sql.executeRowAsync
         |> TaskResult.ofTask
         |> TaskResult.catch (SqlLib.matchWrongExpectedVersion)
-        |> TaskResult.map (fun result -> MessageAppended(streamName, result))
+        |> TaskResult.map GlobalPosition
 
-    let internal writeMessageSync streamName message expectedVersion sqlProps =
-        sqlProps
-        |> SqlLib.writeMessage streamName message expectedVersion
-        |> Result.catch (fun tuple -> tuple ||> Sql.executeRow)
-        |> Result.mapError SqlLib.matchWrongExpectedVersion
-        |> Result.map (fun result -> MessageAppended(streamName, result))
-
-
-    let internal getStreamMessages streamName position batchSize sqlProps =
+    let getStreamMessages streamName position batchSize sqlProps =
         sqlProps
         |> SqlLib.getStreamMessages streamName position batchSize
         ||> Sql.executeAsync
-        |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
 
-    let internal getCategoryMessages
-        categoryName
-        position
-        batchSize
-        correlation
-        consumerGroupMember
-        consumberGroupSize
+    let getCategoryMessages categoryName position batchSize correlation consumerGroupMember consumerGroupSize sqlProps =
         sqlProps
-        =
-        sqlProps
-        |> SqlLib.getCategoryMessages categoryName position batchSize correlation consumerGroupMember consumberGroupSize
+        |> SqlLib.getCategoryMessages categoryName position batchSize correlation consumerGroupMember consumerGroupSize
         ||> Sql.executeAsync
-        |> Task.map (fun msgs -> StreamMessagesRead(categoryName, msgs))
+    // |> Task.map StreamMessages
 
-    let internal getLastMessage streamName sqlProps =
+    let getLastMessage streamName sqlProps =
         sqlProps
         |> SqlLib.getLastMessage streamName
         ||> Sql.executeAsync
-        |> Task.map (fun msgs -> StreamMessagesRead(streamName, msgs))
+        |> Task.map List.tryHead
 
-    let internal getStreamVersion streamName sqlProps =
+    let getStreamVersion streamName sqlProps =
         sqlProps
         |> SqlLib.getStreamVersion streamName
         ||> Sql.executeRowAsync
 
 type StatelessClient(connectionString: string) =
-    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
+    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: StreamVersion) =
+        let expectedVersion' =
+            (match expectedVersion with
+             | Some NoStream -> Some -1L
+             | Some (Version n) -> Some n
+             | Some Any -> None
+             | None -> None)
+
         connectionString
         |> Sql.connect
-        |> InternalClient.writeMessageAsync streamName message expectedVersion
+        |> SqlClient.writeMessageAsync streamName message expectedVersion'
 
     member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
         connectionString
         |> Sql.connect
-        |> InternalClient.getStreamMessages streamName position batchSize
+        |> SqlClient.getStreamMessages streamName position batchSize
 
     member __.GetCategoryMessages
         (
@@ -275,27 +265,33 @@ type StatelessClient(connectionString: string) =
             ?batchSize: BatchSize,
             ?correlation: string,
             ?consumerGroupMember: int64,
-            ?consumberGroupSize: int64
+            ?consumerGroupSize: int64
         ) =
         connectionString
         |> Sql.connect
-        |> InternalClient.getCategoryMessages
+        |> SqlClient.getCategoryMessages
             categoryName
             position
             batchSize
             correlation
             consumerGroupMember
-            consumberGroupSize
+            consumerGroupSize
 
     member __.GetLastMessage(streamName: string) =
         connectionString
         |> Sql.connect
-        |> InternalClient.getLastMessage streamName
+        |> SqlClient.getLastMessage streamName
+
+    member __.TryStreamHead(streamName: string) =
+        connectionString
+        |> Sql.connect
+        |> SqlClient.getStreamMessages streamName (Some 0L) (Some <| Limited 1L)
+        |> Task.map List.tryHead
 
     member __.GetStreamVersion(streamName: string) =
         connectionString
         |> Sql.connect
-        |> InternalClient.getStreamVersion streamName
+        |> SqlClient.getStreamVersion streamName
 
     member __.GetCategory(streamName: string) =
         connectionString
@@ -320,20 +316,17 @@ type Synchronicity =
     | EagerAsyncTasks
 // | LazyAsyncs
 
-type ExclusiveConsumer = ExclusiveConsumer of unit
-
-type GroupConsumer = GroupConsumer of unit
 
 type StatefulClient(connection: Npgsql.NpgsqlConnection) =
     member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
         connection
         |> Sql.existingConnection
-        |> InternalClient.writeMessageAsync streamName message expectedVersion
+        |> SqlClient.writeMessageAsync streamName message expectedVersion
 
     member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
         connection
         |> Sql.existingConnection
-        |> InternalClient.getStreamMessages streamName position batchSize
+        |> SqlClient.getStreamMessages streamName position batchSize
 
     member __.GetCategoryMessages
         (
@@ -342,27 +335,27 @@ type StatefulClient(connection: Npgsql.NpgsqlConnection) =
             ?batchSize: BatchSize,
             ?correlation: string,
             ?consumerGroupMember: int64,
-            ?consumberGroupSize: int64
+            ?consumerGroupSize: int64
         ) =
         connection
         |> Sql.existingConnection
-        |> InternalClient.getCategoryMessages
+        |> SqlClient.getCategoryMessages
             categoryName
             position
             batchSize
             correlation
             consumerGroupMember
-            consumberGroupSize
+            consumerGroupSize
 
     member __.GetLastMessage(streamName: string) =
         connection
         |> Sql.existingConnection
-        |> InternalClient.getLastMessage streamName
+        |> SqlClient.getLastMessage streamName
 
     member __.GetStreamVersion(streamName: string) =
         connection
         |> Sql.existingConnection
-        |> InternalClient.getStreamVersion streamName
+        |> SqlClient.getStreamVersion streamName
 
     member __.GetCategory(streamName: string) =
         connection
