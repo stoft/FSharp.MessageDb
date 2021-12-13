@@ -28,7 +28,7 @@ module Contracts =
 
     type BatchSize =
         | All
-        | Limited of int64
+        | Limited of int
 
     type StreamMessages = StreamMessages of recordedMessages: RecordedMessage list
     type CategoryMessages = CategoryMessages of recordedMessages: RecordedMessage list
@@ -54,16 +54,20 @@ module internal Result =
 module internal TaskResult =
     let bindError: ('Error -> Task<Result<'a, 'Error2>>) -> Task<Result<'a, 'Error>> -> Task<Result<'a, 'Error2>> =
         fun fError ->
-            Task.bind (function
+            Task.bind
+                (function
                 | Ok v -> TaskResult.ok v
                 | Error e -> fError e)
+
+module internal Option =
+    let ofBool: 'a -> bool -> 'a option = fun v b -> if b then Some v else None
 
 module Int64 =
     let ofBatchSizeOption =
         function
         | None -> None
         | Some All -> Some -1L
-        | Some (Limited x) -> Some x
+        | Some (Limited x) -> Some(int64 x)
 
 module DbConnectionString =
     type DbConfig =
@@ -91,7 +95,6 @@ module StreamName =
     let ofCategoryName (categoryName: string) (suffixId: string) = $"%s{categoryName}-%s{suffixId}"
 
 module SqlLib =
-
     let private toFunc (functionName: string) (parameters: (string * SqlValue) list) =
         Sql.query
         <| sprintf
@@ -114,11 +117,27 @@ module SqlLib =
 
     let private int64Reader name (read: RowReader) = read.int64 name
     let private stringReader name (read: RowReader) = read.string name
+    let private boolReader name (read: RowReader) = read.bool name
+
+    let doTryGetAdvisoryLock (key: int64) : Sql.SqlProps -> Task<bool> =
+        Sql.query "SELECT * from pg_try_advisory_lock(@key)"
+        >> Sql.parameters [ "key", Sql.int64 key ]
+        >> Sql.executeAsync (fun read -> read.bool "pg_try_advisory_lock")
+        >> Task.map List.head
 
     let matchWrongExpectedVersion (err: exn) =
         match err.Message with
         | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
         | _ -> raise err
+
+    let hash (streamName: string) (sqlProps: Sql.SqlProps) : ((RowReader -> int64) * Sql.SqlProps) =
+        let funcName = "hash_64"
+
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
+
+        let func = toFunc funcName parameters sqlProps
+        (int64Reader funcName, func)
 
     let writeMessage
         (streamName: string)
@@ -153,7 +172,8 @@ module SqlLib =
               nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
               "condition", Sql.stringOrNone None ]
 
-        let func = toFunc "get_stream_messages" parameters sqlProps
+        let func =
+            toFunc "get_stream_messages" parameters sqlProps
 
         (readMessage, func)
 
@@ -175,19 +195,23 @@ module SqlLib =
               nameof consumerGroupSize, Sql.int64OrNone consumerGroupSize
               "condition", Sql.stringOrNone None ]
 
-        let func = toFunc "get_category_messages" parameters sqlProps
+        let func =
+            toFunc "get_category_messages" parameters sqlProps
 
         (readMessage, func)
 
     let getLastMessage (streamName: string) (sqlProps: Sql.SqlProps) =
-        let parameters = [ nameof streamName, Sql.text streamName ]
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
 
-        let func = toFunc "get_last_stream_message" parameters sqlProps
+        let func =
+            toFunc "get_last_stream_message" parameters sqlProps
 
         (readMessage, func)
 
     let getStreamVersion (streamName: string) sqlProps =
-        let parameters = [ nameof streamName, Sql.text streamName ]
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
 
         let funcName = "stream_version"
 
@@ -196,7 +220,8 @@ module SqlLib =
         (int64Reader funcName, func)
 
     let getCategory (streamName: string) sqlProps =
-        let parameters = [ nameof streamName, Sql.text streamName ]
+        let parameters =
+            [ nameof streamName, Sql.text streamName ]
 
         let funcName = "category"
 
@@ -210,6 +235,15 @@ module SqlLib =
         |> Sql.parameters [ nameof id, Sql.uuid id ]
 
 module SqlClient =
+    let hash64 streamName sqlProps =
+        sqlProps
+        |> SqlLib.hash streamName
+        ||> Sql.executeRowAsync
+
+    let doTryGetAdvisoryLockOnStreamName streamName sqlProps =
+        hash64 streamName sqlProps
+        |> Task.bind (fun hash -> SqlLib.doTryGetAdvisoryLock hash sqlProps)
+
     let writeMessageAsync streamName message expectedVersion sqlProps =
         sqlProps
         |> SqlLib.writeMessage streamName message expectedVersion
@@ -285,7 +319,7 @@ type StatelessClient(connectionString: string) =
     member __.TryStreamHead(streamName: string) =
         connectionString
         |> Sql.connect
-        |> SqlClient.getStreamMessages streamName (Some 0L) (Some <| Limited 1L)
+        |> SqlClient.getStreamMessages streamName (Some 0L) (Some <| Limited 1)
         |> Task.map List.tryHead
 
     member __.GetStreamVersion(streamName: string) =
