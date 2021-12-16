@@ -1,14 +1,11 @@
 open Expecto
-// open Serilog
+open Serilog
 
 [<EntryPoint>]
 let main argv =
-
-    // Log.Logger <-
-    //     LoggerConfiguration()
-    //         // .Destructure.FSharpTypes()
-    //         .WriteTo
-    //         .Console()
-    //         .CreateLogger()
+    Log.Logger <-
+        LoggerConfiguration()
+            .WriteTo.Console()
+            .CreateLogger()
 
     runTestsInAssemblyWithCLIArgs (Seq.singleton <| Colours 256) argv

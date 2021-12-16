@@ -4,6 +4,7 @@ open Expecto
 open Expecto.Flip
 open FSharp.MessageDb
 open FsToolkit.ErrorHandling
+open Serilog
 
 let cnxString =
     DbConnectionString.create
@@ -30,11 +31,11 @@ let teardown id = store.DeleteMessage(id)
 
 [<Tests>]
 let tests =
-    ftestList
+    testList
         "CategoryConsumer"
         [ testList
             "readBatch"
-            [ ftest "should succeed" {
+            [ test "should succeed" {
                   let handler =
                       fun x ->
                           printfn "received: ................ %A" x
@@ -46,9 +47,9 @@ let tests =
                           (Limited 20)
                           "test"
                           handler
-                          0L
                           0
                           1
+                          0L
 
                   let guid =
                       System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D4"
@@ -60,24 +61,60 @@ let tests =
           testList
               "ExclusiveConsumer"
               [ test "with any position should succeed" {
+                  let handler =
+                      fun (x: RecordedMessage) ->
+                          printfn "received: ................"
+                          // Expect.exists "" x.id
+                          Task.singleton ()
+
+                  let consumer1 =
+                      CategoryConsumer.ExclusiveConsumer.ofConnectionString
+                          Log.Logger
+                          cnxString
+                          "testExclusiveConsumer"
+                          "test"
+                          handler
+                          0L
+
+                  let guid =
+                      System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
+
+                  // writeMsg "test-x" guid
+                  // printfn "%A" consumer.Result
+                  teardown guid
+                }
+                test "should lock second consumer" {
+                    let guid =
+                        System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
+
                     let handler =
                         fun (x: RecordedMessage) ->
-                            printfn "received: ................ %A" x
-                            // Expect.exists "" x.id
+                            Expect.equal "" x.id guid
                             Task.singleton ()
 
-                    let consumer =
+                    writeMsg "test-x" guid
+
+                    let consumer1 =
                         CategoryConsumer.ExclusiveConsumer.ofConnectionString
+                            Log.Logger
                             cnxString
                             "testExclusiveConsumer"
                             "test"
                             handler
                             0L
 
-                    let guid =
-                        System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
+                    let c2 =
+                        CategoryConsumer.ExclusiveConsumer.ofConnectionString
+                            Log.Logger
+                            cnxString
+                            "testExclusiveConsumer"
+                            "test"
+                            handler
+                            0L
 
-                    // writeMsg "test-x" guid
+
                     // printfn "%A" consumer.Result
-                    teardown guid
+                    (CategoryConsumer.ConsumerLib.delayTask 10).Wait()
+
+                    teardown guid |> ignore
                 } ] ]

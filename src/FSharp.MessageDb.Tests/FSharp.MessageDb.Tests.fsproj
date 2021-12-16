@@ -21,6 +21,8 @@
     <PackageReference Include="Expecto" Version="9.0.2" />
     <PackageReference Include="FsToolkit.ErrorHandling.TaskResult" Version="2.10.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="16.7.1" />
+    <PackageReference Include="Serilog" Version="2.10.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="4.0.1" />
     <PackageReference Include="YoloDev.Expecto.TestSdk" Version="0.11.1" />
   </ItemGroup>
 

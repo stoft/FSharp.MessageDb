@@ -4,7 +4,7 @@ open System.Threading.Tasks
 open FsToolkit.ErrorHandling
 open Npgsql.FSharp
 open FSharp.MessageDb
-open Microsoft.Extensions.Logging
+open Serilog
 
 module ConsumerLib =
     let delayTask (delayTimeSeconds: int) =
@@ -21,10 +21,11 @@ module ConsumerLib =
         (batchSize: BatchSize)
         (categoryName: string)
         (handler: RecordedMessage -> Task<unit>)
-        (fromPosition: int64)
         (consumerGroupMember: int)
         (consumerGroupSize: int)
-        =
+        (fromPosition: int64)
+        : Task<Result<RecordedMessage option, exn>> =
+
         let handler': RecordedMessage -> Task<Result<unit, exn>> = handler >> TaskResult.ofTask
 
         taskResult {
@@ -42,20 +43,10 @@ module ConsumerLib =
             return List.tryLast msgs
         }
 
-    let rec readContinuously
-        (client: StatelessClient)
-        (batchSize: BatchSize)
-        (categoryName: string)
-        (handler: RecordedMessage -> Task<unit>)
-        (fromPosition: int64)
-        (consumerGroupMember: int)
-        (consumerGroupSize: int)
-        =
+    let rec readContinuously (f: int64 -> Task<Result<RecordedMessage option, exn>>) (fromPosition: int64) =
+        let rc fromPos' = readContinuously f fromPos'
 
-        let rc fromPos' =
-            readContinuously client batchSize categoryName handler fromPos' consumerGroupMember consumerGroupSize
-
-        readBatch client batchSize categoryName handler fromPosition consumerGroupMember consumerGroupSize
+        f fromPosition
         |> Task.bind
             (function
             | Ok (Some msg) -> rc (msg.globalPosition + 1L)
@@ -76,7 +67,13 @@ module CompetingConsumer =
                 | false -> doTryGetAdvisoryLockForStreamNames connection tail)
 
     let rec private doTryGetAdvisoryLockWithRetry connection retryCount (streamNames: string list) : Task<int> =
-        let delayTime = if retryCount > 0 then 50 else 0
+        let delayTime =
+            if retryCount > 0 then
+                printfn "locked out, sleeping"
+                Log.Logger.Debug("Locked out, sleeping.")
+                50
+            else
+                0
 
         let convertToGroupMember gp = streamNames |> List.findIndex ((=) gp)
 
@@ -98,9 +95,9 @@ module CompetingConsumer =
 
         doTryGetAdvisoryLockWithRetry connection 0 streamNames
 
-
     let ofConnectionString
         (connectionString: string)
+        (logger: ILogger)
         (consumerName: string)
         (categoryName: string)
         (handler: RecordedMessage -> Task<unit>)
@@ -117,24 +114,19 @@ module CompetingConsumer =
 
             return!
                 ConsumerLib.readContinuously
-                    client
-                    (Limited 20)
-                    categoryName
-                    handler
+                    (ConsumerLib.readBatch client (Limited 20) categoryName handler groupMember consumerGroupSize)
                     fromPosition
-                    groupMember
-                    consumerGroupSize
         }
 
 module ExclusiveConsumer =
 
     /// Convenience function, this is equal to a competing consumer with a group size of 1
     let ofConnectionString
+        (logger: ILogger)
         (connectionString: string)
-        // (logger: ILogger)
         (consumerName: string)
         (categoryName: string)
         (handler: RecordedMessage -> Task<unit>)
         (fromPosition: int64)
         =
-        CompetingConsumer.ofConnectionString connectionString consumerName categoryName handler fromPosition 1
+        CompetingConsumer.ofConnectionString connectionString logger consumerName categoryName handler fromPosition 1
