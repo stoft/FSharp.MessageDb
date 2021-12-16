@@ -4,6 +4,7 @@ open Expecto
 open Expecto.Flip
 open FSharp.MessageDb
 open Npgsql.Logging
+open Npgsql.FSharp
 
 let message =
     { id = (System.Guid.NewGuid())
@@ -52,28 +53,26 @@ let tests =
     testList
         "SqlLib"
         [ testList
-            "hash"
-            [ test "should work" {
-                  let t =
-                      (cnxString
-                       |> Npgsql.FSharp.Sql.connect
-                       |> SqlClient.hash64 "test-hash1")
+              "hash"
+              [ test "should work" {
+                    let t =
+                        (cnxString
+                         |> Npgsql.FSharp.Sql.connect
+                         |> SqlClient.hash64 "test-hash1")
 
-                  Expect.equal "" -7674236520607344939L t.Result
-              } ]
+                    Expect.equal "" -7674236520607344939L t.Result
+                } ]
           testList
               "doTryGetAdvisoryLock"
-              [ ftest "should return true for first and false for second" {
+              [ test "should return true for first and false for second" {
                     use connection =
                         cnxString
                         |> Npgsql.FSharp.Sql.connect
                         |> Npgsql.FSharp.Sql.createConnection
 
-                    let props =
-                        connection |> Npgsql.FSharp.Sql.existingConnection
+                    let props = connection |> Npgsql.FSharp.Sql.existingConnection
 
-                    let first =
-                        SqlLib.doTryGetAdvisoryLock -7674236520607344939L props
+                    let first = SqlLib.doTryGetAdvisoryLock -7674236520607344939L props
 
                     Expect.isTrue "" first.Result
 
@@ -98,25 +97,22 @@ let tests =
           testList
               "writeMessage"
               [ test "with any position should succeed" {
-                  let guid =
-                      System.Guid.Parse "ce83d845-2620-475c-abb6-94f727990ee8"
+                    let guid = System.Guid.Parse "ce83d845-2620-475c-abb6-94f727990ee8"
 
-                  let input =
-                      { id = guid
-                        eventType = "test-event"
-                        metadata = None
-                        data = "{}" }
+                    let input =
+                        { id = guid
+                          eventType = "test-event"
+                          metadata = None
+                          data = "{}" }
 
-                  let result =
-                      store.WriteMessage("test-stream1", input).Result
+                    let result = store.WriteMessage("test-stream1", input).Result
 
-                  Expect.wantOk "" result |> ignore
-                  teardown guid |> ignore
+                    Expect.wantOk "" result |> ignore
+                    teardown guid |> ignore
                 }
 
                 test "with position 0 on non-existant stream should fail" {
-                    let guid =
-                        System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a7"
+                    let guid = System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a7"
 
                     let input =
                         { id = guid
@@ -142,8 +138,7 @@ let tests =
                     guid |> teardown |> ignore
                 }
                 test "writing with position NoStream on non-existant stream should succeed" {
-                    let guid =
-                        System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a8"
+                    let guid = System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a8"
 
                     let input = testMessage guid
 
@@ -162,8 +157,7 @@ let tests =
                 }
 
                 test "with position NoStream on existing stream should fail with WrongExpectedVersion" {
-                    let guid =
-                        System.Guid.Parse "f5014710-c87f-4b68-96ae-ceb76e2c598e"
+                    let guid = System.Guid.Parse "f5014710-c87f-4b68-96ae-ceb76e2c598e"
 
                     store
                         .WriteMessage(
@@ -174,8 +168,7 @@ let tests =
                         .Result
                     |> ignore
 
-                    let guid2 =
-                        System.Guid.Parse "a5014710-c87f-4b68-96ae-ceb76e2c598e"
+                    let guid2 = System.Guid.Parse "a5014710-c87f-4b68-96ae-ceb76e2c598e"
 
                     let result2 =
                         store
@@ -206,18 +199,17 @@ let tests =
           testList
               "get_last_message"
               [ test "from empty/non-existant stream should result in empty list" {
-                  let result =
-                      store
-                          .GetLastMessage(
-                              "test-nonExistantStream"
-                          )
-                          .Result
+                    let result =
+                        store
+                            .GetLastMessage(
+                                "test-nonExistantStream"
+                            )
+                            .Result
 
-                  Expect.isNone "" result
+                    Expect.isNone "" result
                 }
                 test "from stream should result in Some message" {
-                    let guid =
-                        System.Guid.Parse "A26EFFE2-F9A8-4EF1-860F-7A73B06D0FC6"
+                    let guid = System.Guid.Parse "A26EFFE2-F9A8-4EF1-860F-7A73B06D0FC6"
 
                     setup "test-oneMessageStream" guid |> ignore
 
@@ -244,8 +236,7 @@ let tests =
           testList
               "delete_message"
               [ test "should succeed" {
-                    let guid =
-                        System.Guid.Parse "1d49e0d9-1007-40c0-9a29-1f4a4f24281a"
+                    let guid = System.Guid.Parse "1d49e0d9-1007-40c0-9a29-1f4a4f24281a"
 
                     store
                         .WriteMessage(
@@ -258,4 +249,19 @@ let tests =
                     let result = (teardown guid).Result
                     result |> Expect.equal "" 1
 
-                } ] ]
+                } ]
+          //   testList
+          //       "multi"
+          //       [ ftest "foo" {
+          //             cnxString
+          //             |> Sql.connect
+          //             |> Sql.executeTransaction [ "set role message_store;", [ [] ]
+          //                                         "SELECT * FROM message_store.write_message('e07ddf02-b682-4b1f-8535-a8e02181f08b', 'test-123', 'event-type','{}', NULL, NULL);",
+          //                                         [ [] ]
+          //                                         "SELECT * FROM message_store.write_message('f07ddf02-b682-4b1f-8535-a8e02181f08b', 'test-123', 'event-type','{}', NULL, -1);",
+          //                                         [ [] ] ]
+          //             |> List.map (printfn "%A")
+
+          //             ()
+          //         } ]
+          ]
