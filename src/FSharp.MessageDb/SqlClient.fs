@@ -10,12 +10,20 @@ open Npgsql.FSharp
 module Contracts =
     open System
 
+    type GlobalPosition = GlobalPosition of position: int64
+
+    module GlobalPosition =
+        let addTo: GlobalPosition -> int64 -> GlobalPosition =
+            fun (GlobalPosition gp) i -> GlobalPosition(gp + i)
+
+        let toInt64 = fun (GlobalPosition gp) -> gp
+
     type RecordedMessage =
         { id: Guid
           streamName: string
           createdTimeUTC: DateTime
           version: int64
-          globalPosition: int64
+          globalPosition: GlobalPosition
           eventType: string
           metadata: string option
           data: string }
@@ -32,8 +40,7 @@ module Contracts =
 
     type StreamMessages = StreamMessages of recordedMessages: RecordedMessage list
     type CategoryMessages = CategoryMessages of recordedMessages: RecordedMessage list
-    type ErrorResponse = WrongExpectedVersion of errMessage: string
-    type GlobalPosition = GlobalPosition of position: int64
+    type WrongExpectedVersion = WrongExpectedVersion of errMessage: string
 
     type StreamVersion =
         | Any
@@ -118,7 +125,7 @@ module SqlLib =
           streamName = reader.string "stream_name"
           createdTimeUTC = reader.dateTime "time"
           version = reader.int64 "position"
-          globalPosition = reader.int64 "global_position"
+          globalPosition = reader.int64 "global_position" |> GlobalPosition
           eventType = reader.string "type"
           metadata = reader.stringOrNone "metadata"
           data = reader.string "data" }
@@ -202,7 +209,7 @@ module SqlLib =
 
     let getCategoryMessages
         (categoryName: string)
-        (position: int64 option)
+        (gp: GlobalPosition option)
         (batchSize: BatchSize option)
         (correlation: string option)
         (consumerGroupMember: int64 option)
@@ -211,7 +218,7 @@ module SqlLib =
         =
         let parameters =
             [ nameof categoryName, Sql.text categoryName
-              nameof position, Sql.int64OrNone position
+              nameof gp, Sql.int64OrNone (Option.map GlobalPosition.toInt64 gp)
               nameof batchSize, Sql.int64OrNone (Int64.ofBatchSizeOption batchSize)
               nameof correlation, Sql.textOrNone correlation
               nameof consumerGroupMember, Sql.int64OrNone consumerGroupMember
@@ -329,7 +336,7 @@ type StatelessClient(connectionString: string) =
     member __.GetCategoryMessages
         (
             categoryName: string,
-            ?position: int64,
+            ?position: GlobalPosition,
             ?batchSize: BatchSize,
             ?correlation: string,
             ?consumerGroupMember: int64,
@@ -373,18 +380,6 @@ type StatelessClient(connectionString: string) =
         |> SqlLib.deleteMessage id
         |> Sql.executeNonQueryAsync
 
-type Client = { executionType: ExecutionType }
-
-and ExecutionType =
-    | ConnectionString of string
-    | Connection of Npgsql.NpgsqlConnection
-
-type Synchronicity =
-    | Sync
-    | EagerAsyncTasks
-// | LazyAsyncs
-
-
 type StatefulClient(connection: Npgsql.NpgsqlConnection) =
     member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: int64) =
         connection
@@ -399,7 +394,7 @@ type StatefulClient(connection: Npgsql.NpgsqlConnection) =
     member __.GetCategoryMessages
         (
             categoryName: string,
-            ?position: int64,
+            ?position: GlobalPosition,
             ?batchSize: BatchSize,
             ?correlation: string,
             ?consumerGroupMember: int64,
