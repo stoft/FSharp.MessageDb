@@ -93,7 +93,22 @@ module ConsumerLib =
                 | Some msg -> deserialize msg.data
                 | None -> GlobalPosition 0L)
 
-module CompetingConsumer =
+/// An Exclusive consumer will lock out other instances of that consumer using a postgres advisory lock.
+/// A Competing consumer will use message-db's consumer groups to cooperatively consume a category, sharded on stream name
+/// (seehttp://docs.eventide-project.org/user-guide/message-db/server-functions.html#consumer-groups).
+/// They will also use advisory locks to block duplicate consumers within their group.
+type ConsumerType =
+    | Exclusive
+    | Competing of groupSize: int
+
+module internal ConsumerType =
+    let toGroupSize =
+        function
+        | Exclusive -> 1
+        | Competing n -> n
+
+/// A stateless consumer will not persist any state, this is up to the calling function and the handler function to set up if at all.
+module StatelessConsumer =
     let rec private doTryGetAdvisoryLockWithRetry
         connection
         retryCount
@@ -133,16 +148,18 @@ module CompetingConsumer =
         (categoryName: string)
         (handler: RecordedMessage -> Task<unit>)
         (fromPosition: GlobalPosition)
-        (consumerGroupSize: int)
+        (consumerType: ConsumerType)
         =
         let savePos = fun _ -> Task.singleton ()
+
+        let consumerGroupSize = ConsumerType.toGroupSize consumerType
 
         taskResult {
             let client = StatelessClient(connectionString)
 
             use connection = new Npgsql.NpgsqlConnection(connectionString)
 
-            let! (groupMember, streamName) = getExclusiveLock consumerName connection consumerGroupSize
+            let! (groupMember, _streamName) = getExclusiveLock consumerName connection consumerGroupSize
 
             return!
                 ConsumerLib.readContinuously
@@ -151,19 +168,7 @@ module CompetingConsumer =
                     fromPosition
         }
 
-module ExclusiveConsumer =
-
-    /// Convenience function, this is equal to a competing consumer with a group size of 1
-    let ofConnectionString
-        (logger: ILogger)
-        (connectionString: string)
-        (consumerName: string)
-        (categoryName: string)
-        (handler: RecordedMessage -> Task<unit>)
-        (fromPosition: GlobalPosition)
-        =
-        CompetingConsumer.ofConnectionString connectionString logger consumerName categoryName handler fromPosition 1
-
+/// A persistent consumer will save state to a dedicated stream in message-db every batch number of messages.
 module PersistentConsumer =
     let ofConnectionString
         (connectionString: string)
@@ -171,10 +176,12 @@ module PersistentConsumer =
         (consumerName: string)
         (categoryName: string)
         (handler: RecordedMessage -> Task<unit>)
-        (consumerGroupSize: int)
+        (consumerType: ConsumerType)
         =
         let savePos client sn =
             ConsumerLib.LastReadPosition.writeLastReadPosition client sn
+
+        let consumerGroupSize = ConsumerType.toGroupSize consumerType
 
         taskResult {
             let client = StatelessClient(connectionString)
@@ -182,7 +189,7 @@ module PersistentConsumer =
             use connection = new Npgsql.NpgsqlConnection(connectionString)
 
             let! (groupMember, streamName) =
-                CompetingConsumer.getExclusiveLock consumerName connection consumerGroupSize
+                StatelessConsumer.getExclusiveLock consumerName connection consumerGroupSize
 
             let! fromPosition =
                 ConsumerLib.LastReadPosition.getLastReadPosition client streamName

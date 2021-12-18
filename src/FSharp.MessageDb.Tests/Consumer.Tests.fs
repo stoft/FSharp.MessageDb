@@ -34,58 +34,56 @@ let tests =
     testList
         "CategoryConsumer"
         [ testList
-            "readBatch"
-            [ test "should succeed" {
-                  let handler =
-                      fun x ->
-                          printfn "received: ................ %A" x
-                          Task.singleton ()
+              "readBatch"
+              [ test "should succeed" {
+                    let handler =
+                        fun x ->
+                            printfn "received: ................ %A" x
+                            Task.singleton ()
 
-                  let readBatch =
-                      CategoryConsumer.ConsumerLib.readBatch
-                          (StatelessClient(cnxString))
-                          (Limited 20)
-                          "test"
-                          handler
-                          0
-                          1
-                          0L
+                    let readBatch =
+                        CategoryConsumer.ConsumerLib.readBatch
+                            (StatelessClient(cnxString))
+                            (Limited 20)
+                            "test"
+                            handler
+                            0
+                            1
+                            (GlobalPosition 0L)
 
-                  let guid =
-                      System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D4"
+                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D4"
 
-                  // writeMsg "test-readBatch" guid
-                  printfn "%A" readBatch.Result
-                  teardown guid
-              } ]
+                    // writeMsg "test-readBatch" guid
+                    printfn "%A" readBatch.Result
+                    teardown guid
+                } ]
           testList
               "ExclusiveConsumer"
               [ test "with any position should succeed" {
-                  let handler =
-                      fun (x: RecordedMessage) ->
-                          printfn "received: ................"
-                          // Expect.exists "" x.id
-                          Task.singleton ()
+                    let handler =
+                        fun (x: RecordedMessage) ->
+                            printfn "received: ................"
+                            // Expect.exists "" x.id
+                            Task.singleton ()
 
-                  let consumer1 =
-                      CategoryConsumer.ExclusiveConsumer.ofConnectionString
-                          Log.Logger
-                          cnxString
-                          "testExclusiveConsumer"
-                          "test"
-                          handler
-                          0L
+                    let consumer1 =
+                        CategoryConsumer.StatelessConsumer.ofConnectionString
+                            cnxString
+                            Log.Logger
+                            "testExclusiveConsumer"
+                            "test"
+                            handler
+                            (GlobalPosition 0L)
+                            CategoryConsumer.ConsumerType.Exclusive
 
-                  let guid =
-                      System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
+                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
 
-                  // writeMsg "test-x" guid
-                  // printfn "%A" consumer.Result
-                  teardown guid
+                    // writeMsg "test-x" guid
+                    // printfn "%A" consumer.Result
+                    teardown guid
                 }
                 test "should lock second consumer" {
-                    let guid =
-                        System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
+                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
 
                     let handler =
                         fun (x: RecordedMessage) ->
@@ -95,22 +93,24 @@ let tests =
                     writeMsg "test-x" guid
 
                     let consumer1 =
-                        CategoryConsumer.ExclusiveConsumer.ofConnectionString
-                            Log.Logger
+                        CategoryConsumer.StatelessConsumer.ofConnectionString
                             cnxString
+                            Log.Logger
                             "testExclusiveConsumer"
                             "test"
                             handler
-                            0L
+                            (GlobalPosition 0L)
+                            CategoryConsumer.ConsumerType.Exclusive
 
                     let c2 =
-                        CategoryConsumer.ExclusiveConsumer.ofConnectionString
-                            Log.Logger
+                        CategoryConsumer.StatelessConsumer.ofConnectionString
                             cnxString
+                            Log.Logger
                             "testExclusiveConsumer"
                             "test"
                             handler
-                            0L
+                            (GlobalPosition 0L)
+                            CategoryConsumer.ConsumerType.Exclusive
 
 
                     // printfn "%A" consumer.Result
