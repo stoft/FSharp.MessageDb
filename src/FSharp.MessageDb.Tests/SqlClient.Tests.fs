@@ -4,7 +4,6 @@ open Expecto
 open Expecto.Flip
 open FSharp.MessageDb
 open Npgsql.Logging
-open Npgsql.FSharp
 
 let message =
     { id = (System.Guid.NewGuid())
@@ -111,7 +110,7 @@ let tests =
                     teardown guid |> ignore
                 }
 
-                test "with position 0 on non-existant stream should fail" {
+                ftest "with position 0 on non-existant stream should fail" {
                     let guid = System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a7"
 
                     let input =
@@ -125,15 +124,12 @@ let tests =
                             .WriteMessage(
                                 "test-stream2",
                                 input,
-                                Version 0L
+                                ExpectedVersion 0L
                             )
                             .Result
 
                     Expect.wantError "should fail" result2
-                    |> Expect.equal
-                        ""
-                        (WrongExpectedVersion
-                            "P0001: Wrong expected version: 0 (Stream: test-stream2, Stream Version: -1)")
+                    |> Expect.equal "" (WrongExpectedVersion <| StreamVersion -1L, [])
 
                     guid |> teardown |> ignore
                 }
@@ -147,7 +143,7 @@ let tests =
                             .WriteMessage(
                                 "test-stream3",
                                 input,
-                                NoStream
+                                NoStreamExpected
                             )
                             .Result
 
@@ -163,7 +159,7 @@ let tests =
                         .WriteMessage(
                             "test-nostreamOnExistingShouldFail",
                             testMessage guid,
-                            NoStream
+                            NoStreamExpected
                         )
                         .Result
                     |> ignore
@@ -175,7 +171,7 @@ let tests =
                             .WriteMessage(
                                 "test-nostreamOnExistingShouldFail",
                                 testMessage guid2,
-                                NoStream
+                                NoStreamExpected
                             )
                             .Result
 

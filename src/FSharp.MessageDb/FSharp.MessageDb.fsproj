@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="SqlClient.fs" />
     <Compile Include="Consumers.fs" />
+    <Compile Include="Producers.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Update="FSharp.Core" Version="5.0.2" />
