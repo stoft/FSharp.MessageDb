@@ -4,8 +4,6 @@ open System.Threading.Tasks
 open FsToolkit.ErrorHandling
 open FSharp.MessageDb
 
-/// Loosely based on https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider
-
 module EventStore =
 
     type Codec<'TEvent, 'TError> =
@@ -39,6 +37,7 @@ module EventStore =
         { appendEvents = appendEvents client codec
           loadEvents = loadEvents client codec }
 
+/// Loosely based on https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider
 module EventSourcedProducer =
 
     type Decider<'TCommand, 'TEvent, 'TState, 'TError> =

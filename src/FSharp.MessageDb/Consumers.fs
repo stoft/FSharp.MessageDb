@@ -116,7 +116,6 @@ module StatelessConsumer =
         : Task<int * string> =
         let delayTime =
             if retryCount > 0 then
-                printfn "locked out, sleeping"
                 Log.Logger.Debug("Locked out, sleeping.")
                 50
             else
