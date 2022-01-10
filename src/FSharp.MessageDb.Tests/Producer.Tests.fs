@@ -29,92 +29,39 @@ let writeMsg streamName guid =
 
 let teardown id = store.DeleteMessage(id)
 
+let decider: Decider<string, string, _, string> =
+    { decide = fun cmd state -> Ok [ cmd ]
+      evolve = fun state event -> state
+      initialState = []
+      isTerminal = fun _ -> false }
+
+let codec: Codec<string, string> =
+    { serialize =
+        fun event ->
+            { eventType = "test"
+              data = "{}"
+              metadata = None
+              id = System.Guid.NewGuid() }
+      deserialize = fun (msg: RecordedMessage) -> msg.data }
+
+let eventStore = Producers.EventStore.start store codec
+
 [<Tests>]
 let tests =
     testList
         "EventSourcingProducer"
         [ testList
-              "readBatch"
+              "decider"
               [ test "should succeed" {
-                    let handler =
-                        fun x ->
-                            printfn "received: ................ %A" x
-                            Task.singleton ()
+                    let handler = Producers.EventSourcedProducer.WithEventStore.start eventStore decider
 
-                    let readBatch =
-                        CategoryConsumer.ConsumerLib.readBatch
-                            (StatelessClient(cnxString))
-                            (Limited 20)
-                            "test"
-                            handler
-                            0
-                            1
-                            (GlobalPosition 0L)
+                    handler "test-ESProducer" ""
+                    |> TaskResult.bind (fun _ ->
 
-                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D4"
+                        store.GetStreamMessages("test-ESProducer")
+                        |> TaskResult.ofTask)
+                    |> TaskResult.map (fun (result :: _) ->
+                        Expect.equal "" "" result.data
+                        [ result ])
 
-                    // writeMsg "test-readBatch" guid
-                    printfn "%A" readBatch.Result
-                    teardown guid
-                } ]
-          testList
-              "ExclusiveConsumer"
-              [ test "with any position should succeed" {
-                    let handler =
-                        fun (x: RecordedMessage) ->
-                            printfn "received: ................"
-                            // Expect.exists "" x.id
-                            Task.singleton ()
-
-                    let consumer1 =
-                        CategoryConsumer.StatelessConsumer.ofConnectionString
-                            cnxString
-                            Log.Logger
-                            "testExclusiveConsumer"
-                            "test"
-                            handler
-                            (GlobalPosition 0L)
-                            CategoryConsumer.ConsumerType.Exclusive
-
-                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
-
-                    // writeMsg "test-x" guid
-                    // printfn "%A" consumer.Result
-                    teardown guid
-                }
-                test "should lock second consumer" {
-                    let guid = System.Guid.Parse "5F14D747-8981-4280-94CA-24825D63E7D5"
-
-                    let handler =
-                        fun (x: RecordedMessage) ->
-                            Expect.equal "" x.id guid
-                            Task.singleton ()
-
-                    writeMsg "test-x" guid
-
-                    let consumer1 =
-                        CategoryConsumer.StatelessConsumer.ofConnectionString
-                            cnxString
-                            Log.Logger
-                            "testExclusiveConsumer"
-                            "test"
-                            handler
-                            (GlobalPosition 0L)
-                            CategoryConsumer.ConsumerType.Exclusive
-
-                    let c2 =
-                        CategoryConsumer.StatelessConsumer.ofConnectionString
-                            cnxString
-                            Log.Logger
-                            "testExclusiveConsumer"
-                            "test"
-                            handler
-                            (GlobalPosition 0L)
-                            CategoryConsumer.ConsumerType.Exclusive
-
-
-                    // printfn "%A" consumer.Result
-                    (CategoryConsumer.ConsumerLib.delayTask 10).Wait()
-
-                    teardown guid |> ignore
                 } ] ]
