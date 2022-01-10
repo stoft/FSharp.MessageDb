@@ -110,7 +110,7 @@ let tests =
                     teardown guid |> ignore
                 }
 
-                ftest "with position 0 on non-existant stream should fail" {
+                test "with position 0 on non-existant stream should fail" {
                     let guid = System.Guid.Parse "b81edb3d-a011-4214-8131-00a4a0deb6a7"
 
                     let input =

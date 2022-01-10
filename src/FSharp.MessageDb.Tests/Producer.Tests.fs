@@ -4,7 +4,8 @@ open Expecto
 open Expecto.Flip
 open FSharp.MessageDb
 open FsToolkit.ErrorHandling
-open Serilog
+open FSharp.MessageDb.Producers.EventSourcedProducer
+open FSharp.MessageDb.Producers.EventStore
 
 let cnxString =
     DbConnectionString.create
@@ -55,13 +56,15 @@ let tests =
               [ test "should succeed" {
                     let handler = Producers.EventSourcedProducer.WithEventStore.start eventStore decider
 
-                    handler "test-ESProducer" ""
-                    |> TaskResult.bind (fun _ ->
-
-                        store.GetStreamMessages("test-ESProducer")
-                        |> TaskResult.ofTask)
-                    |> TaskResult.map (fun (result :: _) ->
-                        Expect.equal "" "" result.data
-                        [ result ])
-
+                    let t =
+                        handler "test-ESProducer" ""
+                        |> TaskResult.bind (fun _ ->
+                            store.GetStreamMessages("test-ESProducer")
+                            |> TaskResult.ofTask)
+                        |> TaskResult.map (fun (result :: _) -> result)
+                    let result = t.Result
+                    Expect.wantOk "" result
+                    |> fun r ->
+                        teardown r.id |> ignore
+                        Expect.equal "" r.data "{}"
                 } ] ]
