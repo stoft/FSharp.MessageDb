@@ -32,7 +32,7 @@ let teardown id = store.DeleteMessage(id)
 
 let decider: Decider<string, string, _, string> =
     { decide = fun cmd state -> Ok [ cmd ]
-      evolve = fun state event -> state
+      evolve = fun state event -> event :: state
       initialState = []
       isTerminal = fun _ -> false }
 
@@ -40,7 +40,7 @@ let codec: Codec<string, string> =
     { serialize =
         fun event ->
             { eventType = "test"
-              data = "{}"
+              data = $"\"%s{event}\""
               metadata = None
               id = System.Guid.NewGuid() }
       deserialize = fun (msg: RecordedMessage) -> msg.data }
@@ -54,7 +54,7 @@ let tests =
         [ testList
               "decider"
               [ test "should succeed" {
-                    let handler = Producers.EventSourcedProducer.WithEventStore.start eventStore decider
+                    let handler = Producers.EventSourcedProducer.start eventStore decider
 
                     let t =
                         handler "test-ESProducer" ""

@@ -46,35 +46,34 @@ module EventSourcedProducer =
           initialState: 'TState
           isTerminal: 'TState -> bool }
 
-    module WithEventStore =
-        let start
-            (eventStore: EventStore.EventStore<'TEvent>)
-            (decider: Decider<'TCommand, 'TEvent, 'TState, 'TError>)
-            : string -> 'TCommand -> Task<Result<'TEvent list, 'TError>> =
-            fun (streamName: string) (command: 'TCommand) ->
-                let rec handle (version: ExpectedVersion) state =
-                    taskResult {
-                        // get events from decision
-                        let! events = decider.decide command state
-
-                        return!
-                            eventStore.appendEvents streamName version events
-                            |> Task.bind (function
-                                | Ok _globalPosition ->
-                                    // save succeeded, we can return events
-                                    TaskResult.ok events
-                                | Error (WrongExpectedVersion actualVersion, catchupEvents) ->
-                                    // it failed, but we now have the events that we missed
-                                    // catch up the current state to the actual state in the database
-                                    let actualState = List.fold decider.evolve state catchupEvents
-                                    // and try again
-                                    handle (ExpectedVersion.ofStreamVersion actualVersion) actualState)
-                    }
+    let start
+        (eventStore: EventStore.EventStore<'TEvent>)
+        (decider: Decider<'TCommand, 'TEvent, 'TState, 'TError>)
+        : string -> 'TCommand -> Task<Result<'TEvent list, 'TError>> =
+        fun (streamName: string) (command: 'TCommand) ->
+            let rec handle (version: ExpectedVersion) state =
                 taskResult {
-                    // load past events
-                    let! version, pastEvents = eventStore.loadEvents streamName
+                    // get events from decision
+                    let! events = decider.decide command state
 
-                    // compute current state
-                    let state = List.fold decider.evolve decider.initialState pastEvents
-                    return! handle (ExpectedVersion.ofStreamVersion version) state
+                    return!
+                        eventStore.appendEvents streamName version events
+                        |> Task.bind (function
+                            | Ok _globalPosition ->
+                                // save succeeded, we can return events
+                                TaskResult.ok events
+                            | Error (WrongExpectedVersion actualVersion, catchupEvents) ->
+                                // it failed, but we now have the events that we missed
+                                // catch up the current state to the actual state in the database
+                                let actualState = List.fold decider.evolve state catchupEvents
+                                // and try again
+                                handle (ExpectedVersion.ofStreamVersion actualVersion) actualState)
                 }
+            taskResult {
+                // load past events
+                let! version, pastEvents = eventStore.loadEvents streamName
+
+                // compute current state
+                let state = List.fold decider.evolve decider.initialState pastEvents
+                return! handle (ExpectedVersion.ofStreamVersion version) state
+            }
