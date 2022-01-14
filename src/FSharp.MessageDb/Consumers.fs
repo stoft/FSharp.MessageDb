@@ -85,7 +85,7 @@ module ConsumerLib =
             client.WriteMessage(streamName, message, Any)
             |> Task.map (function
                 | Ok _ -> ()
-                | Error (WrongExpectedVersion errMsg) -> failwith errMsg)
+                | Error (WrongExpectedVersion ver, _list) -> failwith (string ver))
 
         let getLastReadPosition (client: StatelessClient) streamName : Task<GlobalPosition> =
             client.GetLastMessage(streamName)
@@ -116,7 +116,6 @@ module StatelessConsumer =
         : Task<int * string> =
         let delayTime =
             if retryCount > 0 then
-                printfn "locked out, sleeping"
                 Log.Logger.Debug("Locked out, sleeping.")
                 50
             else

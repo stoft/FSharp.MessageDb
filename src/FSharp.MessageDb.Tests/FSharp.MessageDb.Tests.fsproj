@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="SqlClient.Tests.fs" />
     <Compile Include="Consumer.Tests.fs" />
+    <Compile Include="Producer.Tests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

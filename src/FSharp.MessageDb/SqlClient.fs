@@ -18,11 +18,15 @@ module Contracts =
 
         let toInt64 = fun (GlobalPosition gp) -> gp
 
+    type StreamVersion =
+        | StreamVersion of int64
+        | NoStream
+
     type RecordedMessage =
         { id: Guid
           streamName: string
           createdTimeUTC: DateTime
-          version: int64
+          version: StreamVersion
           globalPosition: GlobalPosition
           eventType: string
           metadata: string option
@@ -38,14 +42,23 @@ module Contracts =
         | All
         | Limited of int
 
-    type StreamMessages = StreamMessages of recordedMessages: RecordedMessage list
-    type CategoryMessages = CategoryMessages of recordedMessages: RecordedMessage list
-    type WrongExpectedVersion = WrongExpectedVersion of errMessage: string
 
-    type StreamVersion =
+    type ExpectedVersion =
         | Any
-        | NoStream
-        | Version of int64
+        | NoStreamExpected
+        | ExpectedVersion of int64
+
+    type StreamMessages = StreamMessages of recordedMessages: RecordedMessage list
+
+    type CategoryMessages = CategoryMessages of recordedMessages: RecordedMessage list
+
+    type WrongExpectedVersion = WrongExpectedVersion of actualVersion: StreamVersion
+
+    module ExpectedVersion =
+        let ofStreamVersion =
+            function
+            | StreamVersion ver -> ExpectedVersion ver
+            | NoStream -> NoStreamExpected
 
 type DbConnectionString = internal DbConnectionString of string
 
@@ -62,6 +75,9 @@ module internal TaskResult =
             Task.bind (function
                 | Ok v -> TaskResult.ok v
                 | Error e -> fError e)
+
+module internal Map =
+    let ofDict (d: System.Collections.Generic.IDictionary<_, _>) = d |> Seq.map (|KeyValue|) |> Map.ofSeq
 
 module internal Option =
     let ofBool: 'a -> bool -> 'a option = fun v b -> if b then Some v else None
@@ -99,6 +115,9 @@ module StreamName =
     let ofCategoryName (categoryName: string) (suffixId: string) = $"%s{categoryName}-%s{suffixId}"
 
 module SqlLib =
+    // [<RequireQualifiedAccess>]
+    // type internal WrongExpectedVersion = WrongExpectedVersion of errMessage: string
+
     type Parameter = (string * SqlValue)
 
     let private toStatement (functionName: string) (parameters: Parameter list) =
@@ -124,7 +143,7 @@ module SqlLib =
         { id = System.Guid.Parse(reader.string "id")
           streamName = reader.string "stream_name"
           createdTimeUTC = reader.dateTime "time"
-          version = reader.int64 "position"
+          version = reader.int64 "position" |> StreamVersion
           globalPosition = reader.int64 "global_position" |> GlobalPosition
           eventType = reader.string "type"
           metadata = reader.stringOrNone "metadata"
@@ -140,9 +159,20 @@ module SqlLib =
         >> Sql.executeAsync (fun read -> read.bool "pg_try_advisory_lock")
         >> Task.map List.head
 
-    let matchWrongExpectedVersion (err: exn) =
+    let internal matchWrongExpectedVersion (err: exn) =
         match err.Message with
-        | _ when err.Message.StartsWith("P0001: Wrong expected version") -> WrongExpectedVersion err.Message
+        | _ when err.Message.StartsWith("P0001: Wrong expected version") ->
+            WrongExpectedVersion(
+                System
+                    .Text
+                    .RegularExpressions
+                    .Regex
+                    .Match(err.Message, "Stream Version: ?(-?\d+)")
+                    .Groups.Item(1)
+                    .ToString()
+                |> int64
+                |> StreamVersion
+            )
         | _ -> raise err
 
     let hash64 (streamName: string) (sqlProps: Sql.SqlProps) : ((RowReader -> int64) * Sql.SqlProps) =
@@ -166,6 +196,9 @@ module SqlLib =
           nameof message.metadata, Sql.jsonbOrNone message.metadata
           nameof expectedVersion, Sql.int64OrNone expectedVersion ]
 
+    let private toStreamVersion (streamName: string) =
+        "stream_version", [ nameof streamName, Sql.text streamName ]
+
     let writeMessage
         (streamName: string)
         (message: UnrecordedMessage)
@@ -179,16 +212,17 @@ module SqlLib =
         (int64Reader funcName, func)
 
     let writeMessages (streamName: string) (messages: UnrecordedMessage list) (expectedVersion: int64 option) =
-        // let queries =
+        let streamVersion = [ toStreamVersion streamName ]
         List.map (fun (a, b) -> a, List.singleton b)
         <| match expectedVersion with
-           | None -> List.map (fun msg -> toWriteMessage streamName msg None) messages
+           | None ->
+               List.map (fun msg -> toWriteMessage streamName msg None) messages
+               |> (@) streamVersion
            | Some version ->
                messages
                |> List.indexed
                |> List.map (fun (idx, msg) -> toWriteMessage streamName msg (Some <| version + (int64 idx)))
-
-    // Sql.executeTransactionAsync queries sqlProps
+               |> (@) streamVersion
 
     let getStreamMessages
         (streamName: string)
@@ -269,18 +303,6 @@ module SqlClient =
         hash64 streamName sqlProps
         |> Task.bind (fun hash -> SqlLib.doTryGetAdvisoryLock hash sqlProps)
 
-    let writeMessageAsync streamName message expectedVersion sqlProps =
-        sqlProps
-        |> SqlLib.writeMessage streamName message expectedVersion
-        ||> Sql.executeRowAsync
-        |> TaskResult.ofTask
-        |> TaskResult.catch (SqlLib.matchWrongExpectedVersion)
-        |> TaskResult.map GlobalPosition
-
-    let writeMessagesAsync streamName messages expectedVersion sqlProps =
-        sqlProps
-        |> Sql.executeTransactionAsync (SqlLib.writeMessages streamName messages expectedVersion)
-
     let getStreamMessages streamName position batchSize sqlProps =
         sqlProps
         |> SqlLib.getStreamMessages streamName position batchSize
@@ -290,7 +312,6 @@ module SqlClient =
         sqlProps
         |> SqlLib.getCategoryMessages categoryName position batchSize correlation consumerGroupMember consumerGroupSize
         ||> Sql.executeAsync
-    // |> Task.map StreamMessages
 
     let getLastMessage streamName sqlProps =
         sqlProps
@@ -303,30 +324,56 @@ module SqlClient =
         |> SqlLib.getStreamVersion streamName
         ||> Sql.executeRowAsync
 
+    let writeMessageAsync streamName message expectedVersion sqlProps =
+        sqlProps
+        |> SqlLib.writeMessage streamName message expectedVersion
+        ||> Sql.executeRowAsync
+        |> TaskResult.ofTask
+        |> TaskResult.catch (SqlLib.matchWrongExpectedVersion)
+        |> TaskResult.map StreamVersion
+        |> TaskResult.bindError (fun wev ->
+            sqlProps
+            |> getStreamMessages streamName (Option.map ((+) 1L) expectedVersion) (Some All)
+            |> Task.bind (fun msgs -> TaskResult.error (wev, msgs)))
+
+    let writeMessagesAsync streamName messages expectedVersion sqlProps =
+        sqlProps
+        |> Sql.executeTransactionAsync (SqlLib.writeMessages streamName messages expectedVersion)
+        |> TaskResult.ofTask
+        |> TaskResult.catch (SqlLib.matchWrongExpectedVersion)
+        |> TaskResult.map (List.last >> int64 >> StreamVersion)
+        |> TaskResult.bindError (fun wev ->
+            sqlProps
+            |> getStreamMessages streamName (Option.map ((+) 1L) expectedVersion) (Some All)
+            |> Task.bind (fun msgs -> TaskResult.error (wev, msgs)))
+
 type StatelessClient(connectionString: string) =
-    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: StreamVersion) =
+    member __.WriteMessage(streamName: string, message: UnrecordedMessage, ?expectedVersion: ExpectedVersion) =
         let expectedVersion' =
-            (match expectedVersion with
-             | Some NoStream -> Some -1L
-             | Some (Version n) -> Some n
-             | Some Any -> None
-             | None -> None)
+            match expectedVersion with
+            | None -> None
+            | Some Any -> None
+            | Some NoStreamExpected -> Some -1L
+            | Some (ExpectedVersion n) -> Some n
 
         connectionString
         |> Sql.connect
         |> SqlClient.writeMessageAsync streamName message expectedVersion'
 
-    member __.WriteMessages(streamName: string, messages: UnrecordedMessage list, ?expectedVersion: StreamVersion) =
+    member __.WriteMessages(streamName: string, messages: UnrecordedMessage list, ?expectedVersion: ExpectedVersion) =
         let expectedVersion' =
-            (match expectedVersion with
-             | Some NoStream -> Some -1L
-             | Some (Version n) -> Some n
-             | Some Any -> None
-             | None -> None)
+            match expectedVersion with
+            | None -> None
+            | Some Any -> None
+            | Some NoStreamExpected -> Some -1L
+            | Some (ExpectedVersion n) -> Some n
 
         connectionString
         |> Sql.connect
-        |> SqlClient.writeMessagesAsync streamName messages expectedVersion'
+        |> (match messages with
+            | [] -> failwith "writeMessages invoked with empty list when expecting at least one element"
+            | [ message ] -> SqlClient.writeMessageAsync streamName message expectedVersion'
+            | manyMessages -> SqlClient.writeMessagesAsync streamName manyMessages expectedVersion')
 
     member __.GetStreamMessages(streamName: string, ?position: int64, ?batchSize: BatchSize) =
         connectionString
